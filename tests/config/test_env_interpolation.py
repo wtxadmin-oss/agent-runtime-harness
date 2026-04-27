@@ -127,3 +127,76 @@ class TestResolveConfig:
         assert resolved.agents.defaults.dream.describe_schedule() == (
             "cron 5 11 * * * (legacy)"
         )
+
+    def test_load_config_auto_loads_dotenv_for_env_interpolation(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "DEEPSEEK_API_KEY=dotenv-key\n",
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {"providers": {"deepseek": {"apiKey": "${DEEPSEEK_API_KEY}"}}}
+            ),
+            encoding="utf-8",
+        )
+
+        raw = load_config(config_path)
+        resolved = resolve_config_env_vars(raw)
+        assert resolved.providers.deepseek.api_key == "dotenv-key"
+
+    def test_load_config_applies_deepseek_defaults_when_unconfigured(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "DEEPSEEK_API_KEY=dotenv-deepseek\n",
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "config.json"
+        config_path.write_text("{}", encoding="utf-8")
+
+        config = load_config(config_path)
+        assert config.providers.deepseek.api_key == "dotenv-deepseek"
+        assert config.providers.deepseek.api_base == "https://api.deepseek.com"
+        assert config.agents.defaults.provider == "deepseek"
+        assert config.agents.defaults.model == "deepseek-v4-flash"
+
+    def test_load_config_does_not_override_user_model_when_already_set(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "DEEPSEEK_API_KEY=dotenv-deepseek\n",
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "agents": {
+                        "defaults": {
+                            "model": "openai/gpt-4o-mini",
+                            "provider": "auto",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_config(config_path)
+        assert config.agents.defaults.model == "openai/gpt-4o-mini"
+        assert config.agents.defaults.provider == "auto"

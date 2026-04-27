@@ -285,4 +285,63 @@ describe("NanobotClient", () => {
     expect(seen).toContain("reconnecting");
     expect(FakeSocket.instances.length).toBeGreaterThan(1);
   });
+
+  it("sends thinking recipe submit/confirm envelopes and routes recipe events", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const onGlobal = vi.fn();
+    const onChat = vi.fn();
+    client.onGlobal(onGlobal);
+    client.onChat("chat-a", onChat);
+    client.connect();
+    lastSocket().fakeOpen();
+
+    client.submitThinkingRecipe("chat-a", {
+      doc_url: "https://api.deepseek.com/docs/reasoning",
+      snippet: "thinking.enabled=true",
+    });
+    client.confirmThinkingRecipe("chat-a", "pv-1");
+
+    expect(lastSocket().sent).toContain(
+      JSON.stringify({
+        type: "thinking_recipe_submit",
+        chat_id: "chat-a",
+        doc_url: "https://api.deepseek.com/docs/reasoning",
+        snippet: "thinking.enabled=true",
+      }),
+    );
+    expect(lastSocket().sent).toContain(
+      JSON.stringify({
+        type: "thinking_recipe_confirm",
+        chat_id: "chat-a",
+        preview_id: "pv-1",
+      }),
+    );
+
+    lastSocket().fakeMessage({
+      event: "thinking_recipe_progress",
+      chat_id: "chat-a",
+      stage: "extracting",
+      message: "extracting",
+    });
+    lastSocket().fakeMessage({
+      event: "thinking_recipe_conflict_detected",
+      chat_id: "chat-a",
+      decision: "url",
+      scoring: { url: { credibility: 0.9 } },
+      evidence: [{ kind: "url", source: "https://api.deepseek.com/docs/reasoning" }],
+    });
+    lastSocket().fakeMessage({
+      event: "thinking_recipe_preview",
+      chat_id: "chat-a",
+      preview_id: "pv-1",
+      recipe: { controls: { enabled_param: "thinking.enabled" } },
+    });
+
+    expect(onGlobal).toHaveBeenCalledTimes(3);
+    expect(onChat).toHaveBeenCalledTimes(3);
+  });
 });

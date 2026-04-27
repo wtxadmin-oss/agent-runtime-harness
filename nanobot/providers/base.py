@@ -496,6 +496,7 @@ class LLMProvider(ABC):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Stream a chat completion, calling *on_content_delta* for each text chunk.
 
@@ -511,6 +512,8 @@ class LLMProvider(ABC):
         )
         if on_content_delta and response.content:
             await on_content_delta(response.content)
+        if on_reasoning_delta and response.reasoning_content:
+            await on_reasoning_delta(response.reasoning_content)
         return response
 
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
@@ -532,6 +535,7 @@ class LLMProvider(ABC):
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
@@ -548,6 +552,7 @@ class LLMProvider(ABC):
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
             on_content_delta=on_content_delta,
+            on_reasoning_delta=on_reasoning_delta,
         )
         return await self._run_with_retry(
             self._safe_chat_stream,

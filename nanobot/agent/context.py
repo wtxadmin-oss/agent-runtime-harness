@@ -9,7 +9,12 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
+from nanobot.utils.helpers import (
+    build_assistant_message,
+    current_time_str,
+    detect_image_mime,
+    ensure_dir,
+)
 from nanobot.utils.prompt_templates import render_template
 
 
@@ -27,20 +32,44 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
+    @staticmethod
+    def _profile_id_from_session_key(session_key: str | None) -> str | None:
+        if not session_key or not session_key.startswith("websocket:"):
+            return None
+        parts = session_key.split(":", 2)
+        if len(parts) < 3:
+            return None
+        profile_id = parts[1].strip()
+        return profile_id or None
+
+    def _profile_workspace(self, profile_id: str) -> Path:
+        return ensure_dir(self.workspace / "users" / profile_id)
+
+    def _memory_for_session(self, session_key: str | None) -> MemoryStore:
+        profile_id = self._profile_id_from_session_key(session_key)
+        if not profile_id:
+            return self.memory
+        return MemoryStore(self._profile_workspace(profile_id))
+
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        session_key: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
+        profile_id = self._profile_id_from_session_key(session_key)
+        if profile_id:
+            parts.append(f"# Profile\n\nCurrent profile_id: {profile_id}")
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(session_key=session_key)
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        memory_store = self._memory_for_session(session_key)
+        memory = memory_store.get_memory_context()
+        if memory and not self._is_template_content(memory_store.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
@@ -53,7 +82,9 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        entries = memory_store.read_unprocessed_history(
+            since_cursor=memory_store.get_last_dream_cursor()
+        )
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
             parts.append("# Recent History\n\n" + "\n".join(
@@ -103,12 +134,16 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self, session_key: str | None = None) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
+        profile_id = self._profile_id_from_session_key(session_key)
+        profile_workspace = self._profile_workspace(profile_id) if profile_id else None
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
+            if profile_workspace is not None and filename in {"SOUL.md", "USER.md"}:
+                file_path = profile_workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
@@ -134,6 +169,7 @@ class ContextBuilder:
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        session_key: str | None = None,
         current_role: str = "user",
         session_summary: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -148,7 +184,14 @@ class ContextBuilder:
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    channel=channel,
+                    session_key=session_key,
+                ),
+            },
             *history,
         ]
         if messages[-1].get("role") == current_role:

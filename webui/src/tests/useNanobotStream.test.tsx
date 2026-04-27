@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { useNanobotStream } from "@/hooks/useNanobotStream";
 import type { InboundEvent } from "@/lib/types";
-import { ClientProvider } from "@/providers/ClientProvider";
+import { ClientProvider, useClient } from "@/providers/ClientProvider";
 
 function fakeClient() {
   const handlers = new Map<string, Set<(ev: InboundEvent) => void>>();
@@ -91,5 +91,115 @@ describe("useNanobotStream", () => {
     expect(result.current.messages).toHaveLength(2);
     expect(result.current.messages[1].role).toBe("assistant");
     expect(result.current.messages[1].kind).toBeUndefined();
+  });
+
+  it("sends thinking params only when model supports thinking and recipe is ready", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => {
+      const stream = useNanobotStream("chat-t", []);
+      const clientCtx = useClient();
+      return { stream, clientCtx };
+    }, {
+      wrapper: wrap(fake.client),
+    });
+
+    act(() => {
+      result.current.clientCtx.setThinkingEnabled(true);
+    });
+
+    act(() => {
+      // Missing recipe: thinking not ready.
+      fake.emit("chat-t", {
+        event: "attached",
+        chat_id: "chat-t",
+        thinking_supported: true,
+        thinking_recipe_ready: false,
+        thinking_unavailable_reason: "missing_recipe",
+      });
+    });
+    // Hook-level assertion: send without thinking metadata when gate not met.
+    act(() => {
+      result.current.stream.send("hello");
+    });
+    expect(fake.client.sendMessage).toHaveBeenLastCalledWith(
+      "chat-t",
+      "hello",
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    // Recipe still not ready, so thinking params must not be sent.
+    act(() => {
+      result.current.stream.send("still plain");
+    });
+    expect(fake.client.sendMessage).toHaveBeenLastCalledWith(
+      "chat-t",
+      "still plain",
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    act(() => {
+      fake.emit("chat-t", {
+        event: "model_selected",
+        chat_id: "chat-t",
+        thinking_supported: true,
+        thinking_recipe_ready: true,
+        thinking_unavailable_reason: null,
+      });
+      result.current.clientCtx.setThinkingEnabled(true);
+      result.current.clientCtx.setReasoningEffort("max");
+    });
+
+    act(() => {
+      result.current.stream.send("now think");
+    });
+    expect(fake.client.sendMessage).toHaveBeenLastCalledWith(
+      "chat-t",
+      "now think",
+      undefined,
+      { enabled: true, effort: "max" },
+      undefined,
+    );
+  });
+
+  it("tracks thinking recipe progress/conflict and clears on preview", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-t", []), {
+      wrapper: wrap(fake.client),
+    });
+
+    act(() => {
+      fake.emit("chat-t", {
+        event: "thinking_recipe_progress",
+        chat_id: "chat-t",
+        stage: "extracting",
+        message: "extracting",
+      });
+      fake.emit("chat-t", {
+        event: "thinking_recipe_conflict_detected",
+        chat_id: "chat-t",
+        decision: "url",
+        scoring: { url: { credibility: 0.9 } },
+        evidence: [{ kind: "url", source: "https://example.com/docs" }],
+      });
+    });
+
+    expect(result.current.thinkingRecipeProgress?.stage).toBe("extracting");
+    expect(result.current.thinkingRecipeConflict?.decision).toBe("url");
+
+    act(() => {
+      fake.emit("chat-t", {
+        event: "thinking_recipe_preview",
+        chat_id: "chat-t",
+        preview_id: "pv-1",
+        recipe: { controls: { enabled_param: "thinking.enabled" } },
+      });
+    });
+
+    expect(result.current.thinkingRecipeProgress).toBeNull();
+    expect(result.current.thinkingRecipeConflict?.decision).toBe("url");
   });
 });

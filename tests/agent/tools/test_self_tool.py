@@ -100,6 +100,25 @@ class TestInspectSummary:
         assert "_last_usage" in result
         assert "_current_iteration" in result
 
+    @pytest.mark.asyncio
+    async def test_inspect_summary_model_prefers_session_selected_model(self):
+        loop = _make_mock_loop()
+        loop.sessions = MagicMock()
+        loop.sessions.list_sessions.return_value = [
+            {"key": "websocket:zhangsan001:chat-a", "updated_at": "2026-04-27T00:00:00Z"},
+        ]
+        loop.sessions.read_session_file.return_value = {
+            "metadata": {
+                "selected_model_name": "glm-4.7",
+            }
+        }
+        tool = _make_tool(loop)
+        tool.set_context("websocket", "chat-a")
+
+        result = await tool.execute(action="check")
+
+        assert "model: 'glm-4.7'" in result
+
 
 # ---------------------------------------------------------------------------
 # check — single key (direct)
@@ -131,6 +150,26 @@ class TestInspectSingleKey:
         tool = _make_tool()
         result = await tool.execute(action="check", key="nonexistent_attr_xyz")
         assert "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_inspect_model_prefers_session_selected_model(self):
+        loop = _make_mock_loop()
+        loop.sessions = MagicMock()
+        loop.sessions.list_sessions.return_value = [
+            {"key": "websocket:zhangsan001:chat-a", "updated_at": "2026-04-27T00:00:00Z"},
+        ]
+        loop.sessions.read_session_file.return_value = {
+            "metadata": {
+                "selected_model_name": "glm-4.7",
+            }
+        }
+        tool = _make_tool(loop)
+        tool.set_context("websocket", "chat-a")
+
+        result = await tool.execute(action="check", key="model")
+
+        assert "glm-4.7" in result
+        assert "session-selected" in result
 
 
 # ---------------------------------------------------------------------------

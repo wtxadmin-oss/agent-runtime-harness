@@ -14,6 +14,8 @@ interface StreamBuffer {
   messageId: string;
   /** Sequence of deltas accumulated in order. */
   parts: string[];
+  /** Accumulated reasoning/thinking content. */
+  reasoningParts: string[];
 }
 
 /**
@@ -33,13 +35,39 @@ export interface SendImage {
   preview: UIImage;
 }
 
+export interface SendOptions {
+  forceDisableThinking?: boolean;
+}
+
+export interface ThinkingRecipePreview {
+  previewId: string;
+  recipe?: Record<string, unknown>;
+  evidence?: Record<string, unknown>[];
+  modelName?: string;
+  baseUrl?: string;
+}
+
+export interface ThinkingRecipeProgress {
+  stage: "submitted" | "extracting" | "compiling" | "preview_ready";
+  message?: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface ThinkingRecipeConflict {
+  modelName?: string;
+  baseUrl?: string;
+  decision?: string;
+  scoring?: Record<string, unknown>;
+  evidence?: Record<string, unknown>[];
+}
+
 export function useNanobotStream(
   chatId: string | null,
   initialMessages: UIMessage[] = [],
 ): {
   messages: UIMessage[];
   isStreaming: boolean;
-  send: (content: string, images?: SendImage[]) => void;
+  send: (content: string, images?: SendImage[], options?: SendOptions) => void;
   setMessages: React.Dispatch<React.SetStateAction<UIMessage[]>>;
   /** Latest transport-level fault raised since the last ``dismissStreamError``.
    * ``null`` when there is nothing to show. */
@@ -47,11 +75,40 @@ export function useNanobotStream(
   /** Clear the current ``streamError`` (e.g. after the user dismisses the
    * notification or starts a fresh action). */
   dismissStreamError: () => void;
+  thinkingRecipeRequired: boolean;
+  clearThinkingRecipeRequired: () => void;
+  thinkingRecipePreview: ThinkingRecipePreview | null;
+  clearThinkingRecipePreview: () => void;
+  thinkingRecipeSaved: boolean;
+  clearThinkingRecipeSaved: () => void;
+  thinkingRecipeError: string | null;
+  clearThinkingRecipeError: () => void;
+  thinkingRecipeProgress: ThinkingRecipeProgress | null;
+  clearThinkingRecipeProgress: () => void;
+  thinkingRecipeConflict: ThinkingRecipeConflict | null;
+  clearThinkingRecipeConflict: () => void;
 } {
-  const { client } = useClient();
+  const {
+    client,
+    thinkingEnabled,
+    reasoningEffort,
+    selectedModelId,
+    setSelectedModelId,
+    setThinkingSupported,
+    setThinkingRecipeReady,
+    setThinkingUnavailableReason,
+    thinkingSupported,
+    thinkingRecipeReady,
+  } = useClient();
   const [messages, setMessages] = useState<UIMessage[]>(initialMessages);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamError, setStreamError] = useState<StreamError | null>(null);
+  const [thinkingRecipeRequired, setThinkingRecipeRequired] = useState(false);
+  const [thinkingRecipePreview, setThinkingRecipePreview] = useState<ThinkingRecipePreview | null>(null);
+  const [thinkingRecipeSaved, setThinkingRecipeSaved] = useState(false);
+  const [thinkingRecipeError, setThinkingRecipeError] = useState<string | null>(null);
+  const [thinkingRecipeProgress, setThinkingRecipeProgress] = useState<ThinkingRecipeProgress | null>(null);
+  const [thinkingRecipeConflict, setThinkingRecipeConflict] = useState<ThinkingRecipeConflict | null>(null);
   const buffer = useRef<StreamBuffer | null>(null);
 
   useEffect(() => {
@@ -59,6 +116,12 @@ export function useNanobotStream(
   }, [client]);
 
   const dismissStreamError = useCallback(() => setStreamError(null), []);
+  const clearThinkingRecipeRequired = useCallback(() => setThinkingRecipeRequired(false), []);
+  const clearThinkingRecipePreview = useCallback(() => setThinkingRecipePreview(null), []);
+  const clearThinkingRecipeSaved = useCallback(() => setThinkingRecipeSaved(false), []);
+  const clearThinkingRecipeError = useCallback(() => setThinkingRecipeError(null), []);
+  const clearThinkingRecipeProgress = useCallback(() => setThinkingRecipeProgress(null), []);
+  const clearThinkingRecipeConflict = useCallback(() => setThinkingRecipeConflict(null), []);
 
   // Reset local state when switching chats. ``streamError`` is scoped to the
   // send that triggered it, so a chat swap should wipe it out: a stale
@@ -68,6 +131,12 @@ export function useNanobotStream(
     setMessages(initialMessages);
     setIsStreaming(false);
     setStreamError(null);
+    setThinkingRecipeRequired(false);
+    setThinkingRecipePreview(null);
+    setThinkingRecipeSaved(false);
+    setThinkingRecipeError(null);
+    setThinkingRecipeProgress(null);
+    setThinkingRecipeConflict(null);
     buffer.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId]);
@@ -76,10 +145,40 @@ export function useNanobotStream(
     if (!chatId) return;
 
     const handle = (ev: InboundEvent) => {
+      if (ev.event === "reasoning_delta") {
+        // Reasoning chunk: create or update the assistant message's reasoning field.
+        const id = buffer.current?.messageId ?? crypto.randomUUID();
+        if (!buffer.current) {
+          buffer.current = { messageId: id, parts: [], reasoningParts: [] };
+          setMessages((prev) => [
+            ...prev,
+            {
+              id,
+              role: "assistant",
+              content: "",
+              isStreaming: true,
+              isThinking: true,
+              reasoning: "",
+              createdAt: Date.now(),
+            },
+          ]);
+          setIsStreaming(true);
+        }
+        buffer.current.reasoningParts.push(ev.text);
+        const combinedReasoning = buffer.current.reasoningParts.join("");
+        const targetId = buffer.current.messageId;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === targetId ? { ...m, reasoning: combinedReasoning, isThinking: true } : m,
+          ),
+        );
+        return;
+      }
+
       if (ev.event === "delta") {
         const id = buffer.current?.messageId ?? crypto.randomUUID();
         if (!buffer.current) {
-          buffer.current = { messageId: id, parts: [] };
+          buffer.current = { messageId: id, parts: [], reasoningParts: [] };
           setMessages((prev) => [
             ...prev,
             {
@@ -92,11 +191,12 @@ export function useNanobotStream(
           ]);
           setIsStreaming(true);
         }
+        // When content starts arriving, thinking phase is done
+        const targetId = buffer.current.messageId;
         buffer.current.parts.push(ev.text);
         const combined = buffer.current.parts.join("");
-        const targetId = buffer.current.messageId;
         setMessages((prev) =>
-          prev.map((m) => (m.id === targetId ? { ...m, content: combined } : m)),
+          prev.map((m) => (m.id === targetId ? { ...m, content: combined, isThinking: false } : m)),
         );
         return;
       }
@@ -111,7 +211,7 @@ export function useNanobotStream(
         setIsStreaming(false);
         setMessages((prev) =>
           prev.map((m) =>
-            m.id === finalId ? { ...m, isStreaming: false } : m,
+            m.id === finalId ? { ...m, isStreaming: false, isThinking: false } : m,
           ),
         );
         return;
@@ -167,6 +267,98 @@ export function useNanobotStream(
         });
         return;
       }
+      if (ev.event === "attached") {
+        setSelectedModelId(ev.selected_model_id ?? null);
+        setThinkingSupported(Boolean(ev.thinking_supported));
+        setThinkingRecipeReady(Boolean(ev.thinking_recipe_ready));
+        setThinkingUnavailableReason(ev.thinking_unavailable_reason ?? null);
+        return;
+      }
+      if (ev.event === "model_selected") {
+        if (ev.chat_id === chatId) {
+          setSelectedModelId(ev.selected_model_id ?? null);
+          setThinkingSupported(Boolean(ev.thinking_supported));
+          setThinkingRecipeReady(Boolean(ev.thinking_recipe_ready));
+          setThinkingUnavailableReason(ev.thinking_unavailable_reason ?? null);
+        }
+        return;
+      }
+      if (ev.event === "thinking_recipe_required") {
+        if (ev.chat_id === chatId) {
+          setThinkingRecipeRequired(true);
+          setThinkingRecipeSaved(false);
+          setThinkingRecipePreview(null);
+          setThinkingRecipeError(null);
+          setThinkingRecipeProgress(null);
+          setThinkingRecipeConflict(null);
+          setThinkingRecipeReady(false);
+          setThinkingUnavailableReason(ev.reason ?? "missing_recipe");
+        }
+        return;
+      }
+      if (ev.event === "thinking_recipe_progress") {
+        if (ev.chat_id === chatId) {
+          setThinkingRecipeProgress({
+            stage: ev.stage,
+            message: ev.message,
+            meta: ev.meta,
+          });
+        }
+        return;
+      }
+      if (ev.event === "thinking_recipe_conflict_detected") {
+        if (ev.chat_id === chatId) {
+          setThinkingRecipeConflict({
+            modelName: ev.model_name,
+            baseUrl: ev.base_url,
+            decision: ev.decision,
+            scoring: ev.scoring,
+            evidence: ev.evidence,
+          });
+        }
+        return;
+      }
+      if (ev.event === "thinking_recipe_preview") {
+        if (ev.chat_id === chatId) {
+          setThinkingRecipePreview({
+            previewId: ev.preview_id,
+            recipe: ev.recipe,
+            evidence: ev.evidence,
+            modelName: ev.model_name,
+            baseUrl: ev.base_url,
+          });
+          setThinkingRecipeError(null);
+          setThinkingRecipeSaved(false);
+          setThinkingRecipeProgress(null);
+        }
+        return;
+      }
+      if (ev.event === "thinking_recipe_saved") {
+        if (ev.chat_id === chatId) {
+          setThinkingRecipeSaved(true);
+          setThinkingRecipeRequired(false);
+          setThinkingRecipePreview(null);
+          setThinkingRecipeError(null);
+          setThinkingRecipeProgress(null);
+          setThinkingRecipeConflict(null);
+          setThinkingRecipeReady(true);
+          setThinkingUnavailableReason(null);
+        }
+        return;
+      }
+      if (ev.event === "thinking_recipe_error") {
+        if (!ev.chat_id || ev.chat_id === chatId) {
+          setThinkingRecipeError(ev.detail ?? "unknown_error");
+          setThinkingRecipeSaved(false);
+          setThinkingRecipeProgress(null);
+          if (ev.detail === "model_does_not_support_thinking") {
+            setThinkingSupported(false);
+            setThinkingRecipeReady(false);
+            setThinkingUnavailableReason(ev.detail);
+          }
+        }
+        return;
+      }
       // ``attached`` / ``error`` frames aren't actionable here; the client
       // shell handles them separately.
     };
@@ -176,10 +368,17 @@ export function useNanobotStream(
       unsub();
       buffer.current = null;
     };
-  }, [chatId, client]);
+  }, [
+    chatId,
+    client,
+    setSelectedModelId,
+    setThinkingRecipeReady,
+    setThinkingSupported,
+    setThinkingUnavailableReason,
+  ]);
 
   const send = useCallback(
-    (content: string, images?: SendImage[]) => {
+    (content: string, images?: SendImage[], options?: SendOptions) => {
       if (!chatId) return;
       const hasImages = !!images && images.length > 0;
       // Text is optional when images are attached — the agent will still see
@@ -198,9 +397,24 @@ export function useNanobotStream(
         },
       ]);
       const wireMedia = hasImages ? images!.map((i) => i.media) : undefined;
-      client.sendMessage(chatId, content, wireMedia);
+      const canSendThinking = thinkingEnabled
+        && thinkingSupported
+        && thinkingRecipeReady
+        && !options?.forceDisableThinking;
+      const thinkingParam = canSendThinking
+        ? { enabled: true, effort: reasoningEffort }
+        : undefined;
+      client.sendMessage(chatId, content, wireMedia, thinkingParam, selectedModelId ?? undefined);
     },
-    [chatId, client],
+    [
+      chatId,
+      client,
+      reasoningEffort,
+      selectedModelId,
+      thinkingEnabled,
+      thinkingRecipeReady,
+      thinkingSupported,
+    ],
   );
 
   return {
@@ -210,5 +424,17 @@ export function useNanobotStream(
     setMessages,
     streamError,
     dismissStreamError,
+    thinkingRecipeRequired,
+    clearThinkingRecipeRequired,
+    thinkingRecipePreview,
+    clearThinkingRecipePreview,
+    thinkingRecipeSaved,
+    clearThinkingRecipeSaved,
+    thinkingRecipeError,
+    clearThinkingRecipeError,
+    thinkingRecipeProgress,
+    clearThinkingRecipeProgress,
+    thinkingRecipeConflict,
+    clearThinkingRecipeConflict,
   };
 }

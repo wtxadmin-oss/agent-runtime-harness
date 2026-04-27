@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { ImageLightbox } from "@/components/ImageLightbox";
 import { MarkdownText } from "@/components/MarkdownText";
+import { ThinkingBlock } from "@/components/ThinkingBlock";
 import { cn } from "@/lib/utils";
 import type { UIImage, UIMessage } from "@/lib/types";
 
@@ -56,7 +57,10 @@ export function MessageBubble({ message }: MessageBubbleProps) {
   const empty = message.content.trim().length === 0;
   return (
     <div className={cn("w-full text-sm", baseAnim)} style={{ lineHeight: "var(--cjk-line-height)" }}>
-      {empty && message.isStreaming ? (
+      {message.reasoning && (
+        <ThinkingBlock reasoning={message.reasoning} isThinking={message.isThinking} />
+      )}
+      {empty && message.isStreaming && !message.isThinking ? (
         <TypingDots />
       ) : (
         <>

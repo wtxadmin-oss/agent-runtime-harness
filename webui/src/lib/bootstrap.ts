@@ -6,8 +6,12 @@ import type { BootstrapResponse } from "./types";
  */
 export async function fetchBootstrap(
   baseUrl: string = "",
+  profileId?: string,
 ): Promise<BootstrapResponse> {
-  const res = await fetch(`${baseUrl}/webui/bootstrap`, {
+  const query = profileId
+    ? `?profile_id=${encodeURIComponent(profileId)}`
+    : "";
+  const res = await fetch(`${baseUrl}/webui/bootstrap${query}`, {
     method: "GET",
     credentials: "same-origin",
   });

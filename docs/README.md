@@ -31,4 +31,4 @@ Use these when you want deeper customization, integration, or extension details.
 | Channel plugin guide | [`channel-plugin-guide.md`](./channel-plugin-guide.md) | Build and test custom chat channel plugins |
 | WebSocket channel | [`websocket.md`](./websocket.md) | Real-time WebSocket access and protocol details |
 | Custom tools | [`my-tool.md`](./my-tool.md) | Inspect and tune runtime state with the `my` tool |
-
+| Thinking parameter ops | [`thinking-parameter-ops.md`](./thinking-parameter-ops.md) | Model isolation, recipe orchestration chain, scoring, and storage boundaries |

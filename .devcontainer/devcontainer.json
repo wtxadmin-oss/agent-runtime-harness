@@ -1,0 +1,47 @@
+{
+	"name": "nanobot Dev",
+	"build": {
+		"context": "..",
+		"dockerfile": "Dockerfile.devcontainer"
+	},
+
+	// 从 .env 文件加载 API key、代理等敏感配置（.env 不进 git）
+	// 更换 API key 或端点时只需编辑 .devcontainer/.env，然后 Rebuild Container
+	"runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"],
+
+	// 端口转发：后端 gateway + 前端 WebUI dev server
+	"forwardPorts": [8765, 18790, 5173, 5174],
+	"portsAttributes": {
+		"8765":  { "label": "nanobot gateway (internal)" },
+		"18790": { "label": "nanobot gateway (external)" },
+		"5173":  { "label": "WebUI dev server", "onAutoForward": "openBrowser" },
+		"5174":  { "label": "Vite HMR" }
+	},
+
+	// 持久化目录：跨 rebuild 保留（volume 不随镜像重建而清空）
+	// - nanobot-config：nanobot 的 config.json、workspace、session 等
+	// - codex-config：Codex CLI 的 OAuth 登录凭证（避免每次 rebuild 后重新登录）
+	"mounts": [
+		"source=nanobot-config,target=/home/vscode/.nanobot,type=volume",
+		"source=codex-config,target=/home/vscode/.codex,type=volume"
+	],
+
+	// 容器创建后自动安装 Python 和前端依赖
+	"postCreateCommand": "pip install -e . && cd webui && bun install",
+
+	"remoteUser": "vscode",
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"ms-python.debugpy"
+			],
+			"settings": {
+				"python.defaultInterpreterPath": "/usr/local/bin/python",
+				"editor.formatOnSave": true
+			}
+		}
+	}
+}

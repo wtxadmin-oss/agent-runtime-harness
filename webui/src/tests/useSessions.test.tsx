@@ -32,12 +32,13 @@ function fakeClient() {
   };
 }
 
-function wrap(client: ReturnType<typeof fakeClient>) {
+function wrap(client: ReturnType<typeof fakeClient>, profileId: string = "demo_alice") {
   return function Wrapper({ children }: { children: ReactNode }) {
     return (
       <ClientProvider
         client={client as unknown as import("@/lib/nanobot-client").NanobotClient}
         token="tok"
+        profileId={profileId}
       >
         {children}
       </ClientProvider>
@@ -162,5 +163,23 @@ describe("useSessions", () => {
     ).rejects.toThrow("boom");
 
     expect(result.current.sessions.map((s) => s.key)).toEqual(["websocket:chat-a"]);
+  });
+
+  it("creates optimistic websocket key scoped to current profile", async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([]);
+    const client = fakeClient();
+    client.newChat.mockResolvedValue("chat-new");
+
+    const { result } = renderHook(() => useSessions(), {
+      wrapper: wrap(client, "demo_bob"),
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.createChat();
+    });
+
+    expect(result.current.sessions[0]?.key).toBe("websocket:demo_bob:chat-new");
   });
 });

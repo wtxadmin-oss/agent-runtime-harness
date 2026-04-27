@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.profile.store import DEFAULT_PROFILE_ID
 from nanobot.utils.helpers import (
     ensure_dir,
     find_legal_message_start,
@@ -137,6 +138,37 @@ class SessionManager:
         """Legacy global session path (~/.nanobot/sessions/)."""
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
 
+    @staticmethod
+    def _legacy_key_from_profile_scoped_websocket(key: str) -> str | None:
+        """Map ``websocket:<default_profile>:<chat>`` to legacy ``websocket:<chat>``."""
+        prefix = f"websocket:{DEFAULT_PROFILE_ID}:"
+        if not key.startswith(prefix):
+            return None
+        chat_id = key[len(prefix):]
+        if not chat_id:
+            return None
+        return f"websocket:{chat_id}"
+
+    def _migrate_profile_scoped_legacy(self, key: str, path: Path) -> bool:
+        """Move a legacy websocket key to the new profile-scoped key if present."""
+        legacy_key = self._legacy_key_from_profile_scoped_websocket(key)
+        if legacy_key is None:
+            return False
+        legacy_path = self._get_session_path(legacy_key)
+        if not legacy_path.exists():
+            return False
+        try:
+            shutil.move(str(legacy_path), str(path))
+            logger.info(
+                "Migrated websocket session {} -> {}",
+                legacy_key,
+                key,
+            )
+            return True
+        except Exception:
+            logger.exception("Failed to migrate websocket session {} -> {}", legacy_key, key)
+            return False
+
     def get_or_create(self, key: str) -> Session:
         """
         Get an existing session or create a new one.
@@ -160,6 +192,8 @@ class SessionManager:
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
+        if not path.exists():
+            self._migrate_profile_scoped_legacy(key, path)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)
             if legacy_path.exists():
@@ -358,6 +392,10 @@ class SessionManager:
         path = self._get_session_path(key)
         self.invalidate(key)
         if not path.exists():
+            legacy_key = self._legacy_key_from_profile_scoped_websocket(key)
+            if legacy_key is not None:
+                path = self._get_session_path(legacy_key)
+        if not path.exists():
             return False
         try:
             path.unlink()
@@ -366,6 +404,29 @@ class SessionManager:
             logger.warning("Failed to delete session file {}: {}", path, e)
             return False
 
+    def purge_profile_sessions(self, profile_id: str) -> int:
+        """Delete all websocket sessions for a profile from cache and disk.
+
+        Returns the number of disk files successfully removed.
+        """
+        pid = (profile_id or "").strip()
+        if not pid:
+            return 0
+        prefix = f"websocket:{pid}:"
+        for key in list(self._cache.keys()):
+            if key.startswith(prefix):
+                self.invalidate(key)
+
+        deleted = 0
+        pattern = f"websocket_{pid}_*.jsonl"
+        for path in self.sessions_dir.glob(pattern):
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError as e:
+                logger.warning("Failed to delete profile-scoped session file {}: {}", path, e)
+        return deleted
+
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Load a session from disk without caching; intended for read-only HTTP endpoints.
 
@@ -373,6 +434,8 @@ class SessionManager:
         ``None`` when the session file does not exist or fails to parse.
         """
         path = self._get_session_path(key)
+        if not path.exists():
+            self._migrate_profile_scoped_legacy(key, path)
         if not path.exists():
             return None
         try:
@@ -394,8 +457,12 @@ class SessionManager:
                         stored_key = data.get("key")
                     else:
                         messages.append(data)
+            resolved_key = stored_key or key
+            legacy_key = self._legacy_key_from_profile_scoped_websocket(key)
+            if legacy_key is not None and resolved_key == legacy_key:
+                resolved_key = key
             return {
-                "key": stored_key or key,
+                "key": resolved_key,
                 "created_at": created_at,
                 "updated_at": updated_at,
                 "metadata": metadata,

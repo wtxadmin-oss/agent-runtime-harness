@@ -4,6 +4,7 @@ import { useClient } from "@/providers/ClientProvider";
 import i18n from "@/i18n";
 import {
   ApiError,
+  buildSessionKey,
   deleteSession as apiDeleteSession,
   fetchSessionMessages,
   listSessions,
@@ -22,7 +23,7 @@ export function useSessions(): {
   createChat: () => Promise<string>;
   deleteChat: (key: string) => Promise<void>;
 } {
-  const { client, token } = useClient();
+  const { client, token, profileId } = useClient();
   const [sessions, setSessions] = useState<ChatSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +51,7 @@ export function useSessions(): {
 
   const createChat = useCallback(async (): Promise<string> => {
     const chatId = await client.newChat();
-    const key = `websocket:${chatId}`;
+    const key = buildSessionKey(profileId, chatId);
     // Optimistic insert; a subsequent refresh will replace it with the
     // authoritative row once the server persists the session.
     setSessions((prev) => [
@@ -65,7 +66,7 @@ export function useSessions(): {
       ...prev.filter((s) => s.key !== key),
     ]);
     return chatId;
-  }, [client]);
+  }, [client, profileId]);
 
   const deleteChat = useCallback(
     async (key: string) => {

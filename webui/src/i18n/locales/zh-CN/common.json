@@ -21,6 +21,32 @@
     "collapse": "收起侧边栏",
     "toggleTheme": "切换主题",
     "newChat": "新建对话",
+    "createUser": {
+      "open": "新建用户",
+      "title": "新建用户",
+      "description": "创建 profile 并立即切换。",
+      "placeholder": "用户名",
+      "submit": "创建",
+      "submitting": "创建中…",
+      "errors": {
+        "empty": "请输入用户名",
+        "failed": "创建用户失败"
+      }
+    },
+    "profile": {
+      "select": "选择用户"
+    },
+    "deleteUser": {
+      "open": "删除用户",
+      "none": "无可删除用户",
+      "title": "删除“{{name}}”？",
+      "description": "将删除该 profile 以及本地数据（会话、记忆文件）。",
+      "submit": "删除",
+      "submitting": "删除中…",
+      "errors": {
+        "failed": "删除用户失败"
+      }
+    },
     "recent": "最近对话",
     "refreshSessions": "刷新会话",
     "language": {

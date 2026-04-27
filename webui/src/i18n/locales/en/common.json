@@ -21,6 +21,32 @@
     "collapse": "Collapse sidebar",
     "toggleTheme": "Toggle theme",
     "newChat": "New chat",
+    "createUser": {
+      "open": "Create user",
+      "title": "Create user",
+      "description": "Create a profile and switch to it immediately.",
+      "placeholder": "Username",
+      "submit": "Create",
+      "submitting": "Creating…",
+      "errors": {
+        "empty": "Username is required",
+        "failed": "Failed to create user"
+      }
+    },
+    "profile": {
+      "select": "Select profile"
+    },
+    "deleteUser": {
+      "open": "Delete user",
+      "none": "No deletable users",
+      "title": "Delete “{{name}}”?",
+      "description": "This will remove the profile and its local data (sessions, memory files).",
+      "submit": "Delete",
+      "submitting": "Deleting…",
+      "errors": {
+        "failed": "Failed to delete user"
+      }
+    },
     "recent": "Recent",
     "refreshSessions": "Refresh sessions",
     "language": {

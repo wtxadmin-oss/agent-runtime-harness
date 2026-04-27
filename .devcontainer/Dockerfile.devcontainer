@@ -1,0 +1,36 @@
+# Dev Container 专用镜像
+# 基于官方 devcontainers Python 镜像（已内置 vscode 用户、pip、git、zsh 等开发工具）
+# 与项目生产 Dockerfile 保持一致：Python 3.12 + Node.js 20 + bun
+FROM mcr.microsoft.com/devcontainers/python:3.12-bookworm
+
+# 安装系统依赖（与项目根 Dockerfile 保持一致）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg bubblewrap openssh-client && \
+    # 安装 Node.js 20
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends nodejs && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装 bun（以 vscode 用户身份安装，避免 root 路径问题）
+USER vscode
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/home/vscode/.bun/bin:$PATH"
+
+# 安装 uv（快速 Python 包管理器）
+USER root
+RUN pip install --no-cache-dir uv
+
+# 安装 Claude Code CLI（全局，所有用户可用）
+RUN npm install -g @anthropic-ai/claude-code
+
+# 安装 OpenAI Codex CLI（全局）
+RUN npm install -g @openai/codex
+
+USER vscode

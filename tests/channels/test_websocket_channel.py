@@ -26,6 +26,8 @@ from nanobot.channels.websocket import (
     _parse_query,
     _parse_request_path,
 )
+from nanobot.profile import resolve_global_base_model
+from nanobot.session.manager import SessionManager
 
 # -- Shared helpers (aligned with test_websocket_integration.py) ---------------
 
@@ -304,6 +306,7 @@ async def test_end_to_end_client_receives_ready_and_agent_sees_inbound(bus: Magi
             assert inbound.sender_id == "tester"
             assert inbound.chat_id == chat_id
             assert inbound.content == "ping from client"
+            assert inbound.session_key_override == f"websocket:demo_alice:{chat_id}"
 
             await client.send("plain text frame")
             await asyncio.sleep(0.08)
@@ -404,6 +407,38 @@ async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_profile_token_binds_websocket_session_scope(
+    bus: MagicMock,
+) -> None:
+    port = 29895
+    channel = _ch(bus, port=port, websocketRequiresToken=True, path="/")
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+
+    try:
+        boot = await _http_get(
+            f"http://127.0.0.1:{port}/webui/bootstrap?profile_id=demo_bob"
+        )
+        assert boot.status_code == 200
+        token = boot.json()["token"]
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}/?token={token}&client_id=scope-check"
+        ) as client:
+            ready = json.loads(await client.recv())
+            chat_id = ready["chat_id"]
+            await client.send("hello")
+            await asyncio.sleep(0.1)
+            inbound = bus.publish_inbound.call_args[0][0]
+            assert inbound.chat_id == chat_id
+            assert inbound.session_key_override == f"websocket:demo_bob:{chat_id}"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMock) -> None:
     port = 29880
     channel = _ch(bus, port=port, streaming=True)
@@ -457,7 +492,8 @@ async def test_token_issue_rejects_when_at_capacity(bus: MagicMock) -> None:
     try:
         # Fill issued tokens to capacity
         channel._issued_tokens = {
-            f"nbwt_fill_{i}": time.monotonic() + 300 for i in range(channel._MAX_ISSUED_TOKENS)
+            f"nbwt_fill_{i}": (time.monotonic() + 300, "demo_alice")
+            for i in range(channel._MAX_ISSUED_TOKENS)
         }
 
         resp = await _http_get(
@@ -823,3 +859,547 @@ def test_parse_envelope_rejects_legacy_and_garbage() -> None:
 )
 def test_is_valid_chat_id(value: Any, expected: bool) -> None:
     assert _is_valid_chat_id(value) is expected
+
+
+def test_model_list_includes_global_base_and_user_models(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+    channel._model_store.add_model(
+        "alice",
+        name="User Model",
+        model_name="gpt-4o",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-user",
+        supports_thinking=False,
+    )
+
+    asyncio.run(channel._dispatch_envelope(conn, "u1", {"type": "model_list"}))
+
+    assert conn.send.await_count == 1
+    payload = json.loads(conn.send.call_args[0][0])
+    assert payload["event"] == "model_list"
+    assert any(m.get("source") == "global_base" for m in payload["models"])
+    assert any(m.get("source") == "user_custom" for m in payload["models"])
+
+
+def test_model_select_persists_and_message_uses_selected_model(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+    row = channel._model_store.add_model(
+        "alice",
+        name="User Model",
+        model_name="gpt-4o",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-user",
+        supports_thinking=True,
+    )
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "model_select", "chat_id": "chat1", "model_id": row["id"]},
+        )
+    )
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "message", "chat_id": "chat1", "content": "hello"},
+        )
+    )
+
+    inbound = bus.publish_inbound.call_args[0][0]
+    assert inbound.chat_id == "chat1"
+    assert inbound.metadata.get("_model_id") == row["id"]
+
+    asyncio.run(channel._dispatch_envelope(conn, "u1", {"type": "attach", "chat_id": "chat1"}))
+    attached = json.loads(conn.send.call_args[0][0])
+    assert attached["event"] == "attached"
+    assert attached.get("selected_model_id") == row["id"]
+    assert attached.get("thinking_supported") is True
+    assert attached.get("thinking_recipe_ready") is False
+    assert attached.get("thinking_unavailable_reason") == "missing_recipe"
+
+
+def test_attach_clears_deleted_selected_model(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+    row = channel._model_store.add_model(
+        "alice",
+        name="Transient Model",
+        model_name="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-user",
+        supports_thinking=False,
+    )
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "model_select", "chat_id": "chat1", "model_id": row["id"]},
+        )
+    )
+    assert channel._model_store.delete_model("alice", row["id"]) is True
+
+    asyncio.run(channel._dispatch_envelope(conn, "u1", {"type": "attach", "chat_id": "chat1"}))
+
+    attached = json.loads(conn.send.call_args[0][0])
+    assert attached["event"] == "attached"
+    assert attached.get("selected_model_id") is None
+    session = sm.get_or_create("websocket:alice:chat1")
+    assert "selected_model_id" not in session.metadata
+
+
+def test_websocket_model_store_uses_session_manager_workspace(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    row = channel._model_store.add_model(
+        "alice",
+        name="Workspace Scoped",
+        model_name="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        api_key="sk-user",
+        supports_thinking=True,
+    )
+
+    expected_path = tmp_path / "users" / "alice" / "models.json"
+    assert expected_path.exists()
+    payload = json.loads(expected_path.read_text(encoding="utf-8"))
+    assert any(m.get("id") == row["id"] for m in payload.get("models", []))
+
+
+def test_thinking_toggle_emits_recipe_required_event(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+    row = channel._model_store.add_model(
+        "alice",
+        name="Thinkable",
+        model_name="qwen3-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-user",
+        supports_thinking=True,
+    )
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "model_select", "chat_id": "chat1", "model_id": row["id"]},
+        )
+    )
+    conn.send.reset_mock()
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "thinking_toggle", "chat_id": "chat1", "enabled": True},
+        )
+    )
+
+    payload = json.loads(conn.send.call_args[0][0])
+    assert payload["event"] == "thinking_recipe_required"
+    assert payload["chat_id"] == "chat1"
+    assert payload.get("reason") == "missing_recipe"
+
+
+def test_thinking_toggle_for_global_base_does_not_require_recipe(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "thinking_toggle", "chat_id": "chat1", "enabled": True},
+        )
+    )
+
+    assert conn.send.await_count == 0
+
+
+def test_thinking_recipe_submit_and_confirm_persists_global_recipe(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "thinking_recipe_submit",
+                "chat_id": "chat1",
+                "doc_url": "https://api.deepseek.com/docs/reasoning",
+                "snippet": "thinking: { enabled: true, effort: 'high' }",
+            },
+        )
+    )
+    submit_events = [json.loads(args[0][0]) for args in conn.send.await_args_list]
+    progress_stages = [
+        ev.get("stage")
+        for ev in submit_events
+        if ev.get("event") == "thinking_recipe_progress"
+    ]
+    assert progress_stages == ["submitted", "extracting", "compiling", "preview_ready"]
+    preview = next(ev for ev in submit_events if ev.get("event") == "thinking_recipe_preview")
+    assert preview["event"] == "thinking_recipe_preview"
+    preview_id = preview["preview_id"]
+    assert preview_id
+    assert preview["recipe"]["validated"] is True
+
+    conn.send.reset_mock()
+    # Confirm should emit saved event once.
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "thinking_recipe_confirm",
+                "chat_id": "chat1",
+                "preview_id": preview_id,
+            },
+        )
+    )
+    saved = json.loads(conn.send.call_args[0][0])
+    assert saved["event"] == "thinking_recipe_saved"
+    assert isinstance(saved.get("model_signature"), str) and saved["model_signature"]
+
+    recipe_path = tmp_path / "system" / "thinking_recipes.json"
+    assert recipe_path.exists()
+    evidence_dir = tmp_path / "system" / "thinking_evidence"
+    assert evidence_dir.exists()
+    assert list(evidence_dir.glob("*.json"))
+
+
+def test_thinking_recipe_submit_emits_conflict_event_before_preview(tmp_path, monkeypatch) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    async def _fake_submit(**kwargs):
+        on_progress = kwargs.get("on_progress")
+        if callable(on_progress):
+            await on_progress({"stage": "submitted", "message": "request accepted"})
+            await on_progress({"stage": "extracting", "message": "extracting"})
+            await on_progress({"stage": "compiling", "message": "compiling"})
+            await on_progress({"stage": "preview_ready", "message": "ready"})
+        return {
+            "preview_id": "pv-conflict",
+            "recipe": {"validated": True, "controls": {"enabled_param": "enable_thinking"}},
+            "evidence": [{"kind": "url", "source": "https://example.com/docs"}],
+            "orchestrator": {
+                "conflict": True,
+                "decision": "url",
+                "conflict_detail": {
+                    "decision": "url",
+                    "scoring": {"url": {"credibility": 0.9}},
+                    "evidence": [{"kind": "url", "source": "https://example.com/docs"}],
+                },
+            },
+        }
+
+    monkeypatch.setattr(channel._thinking_recipe_orchestrator, "submit", _fake_submit)
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "thinking_recipe_submit",
+                "chat_id": "chat1",
+                "doc_url": "https://example.com/docs",
+                "snippet": "thinking.enabled=true",
+            },
+        )
+    )
+
+    events = [json.loads(args[0][0]) for args in conn.send.await_args_list]
+    conflict_idx = next(i for i, ev in enumerate(events) if ev.get("event") == "thinking_recipe_conflict_detected")
+    preview_idx = next(i for i, ev in enumerate(events) if ev.get("event") == "thinking_recipe_preview")
+    assert conflict_idx < preview_idx
+    conflict = events[conflict_idx]
+    assert conflict.get("decision") == "url"
+    assert isinstance(conflict.get("scoring"), dict)
+    assert isinstance(conflict.get("evidence"), list)
+
+
+def test_thinking_toggle_does_not_require_recipe_when_recipe_exists(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    base = resolve_global_base_model()
+    compiled = channel._thinking_recipe_store.compile(
+        model_name=base["model_name"],
+        base_url=base["base_url"],
+        doc_url="https://api.deepseek.com/docs/reasoning",
+        snippet="thinking.enabled = true",
+    )
+    channel._thinking_recipe_store.save(
+        recipe=compiled["recipe"],
+        evidence=compiled["evidence"],
+    )
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {"type": "thinking_toggle", "chat_id": "chat1", "enabled": True},
+        )
+    )
+
+    assert conn.send.await_count == 0
+
+
+def test_model_add_with_thinking_requires_doc_or_snippet(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "model_add",
+                "name": "Need evidence",
+                "model_name": "qwen3-plus",
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "api_key": "sk-user",
+                "supports_thinking": True,
+            },
+        )
+    )
+
+    payload = json.loads(conn.send.call_args[0][0])
+    assert payload["event"] == "error"
+    assert payload["detail"] == "thinking_source_required"
+
+
+def test_model_add_with_thinking_source_auto_persists_recipe(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "model_add",
+                "name": "Thinkable",
+                "model_name": "qwen3-plus",
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "api_key": "sk-user",
+                "supports_thinking": True,
+                "thinking_doc_url": "https://help.aliyun.com/zh/model-studio/qwen",
+            },
+        )
+    )
+
+    payload = json.loads(conn.send.call_args[0][0])
+    assert payload["event"] == "model_saved"
+    recipe = channel._thinking_recipe_store.lookup(
+        model_name="qwen3-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    assert recipe is not None
+    assert recipe.get("validated") is True
+
+
+def test_message_thinking_missing_recipe_emits_required_and_falls_back(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+    row = channel._model_store.add_model(
+        "alice",
+        name="Thinkable",
+        model_name="qwen3-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-user",
+        supports_thinking=True,
+    )
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "message",
+                "chat_id": "chat1",
+                "content": "hello",
+                "model_id": row["id"],
+                "thinking": {"enabled": True},
+            },
+        )
+    )
+
+    assert conn.send.await_count == 1
+    required = json.loads(conn.send.call_args[0][0])
+    assert required["event"] == "thinking_recipe_required"
+    assert required["reason"] == "missing_recipe"
+
+    inbound = bus.publish_inbound.call_args[0][0]
+    assert inbound.metadata.get("_thinking_enabled") is None
+    assert inbound.metadata.get("_reasoning_effort") is None
+
+
+def test_message_thinking_unvalidated_recipe_emits_required_and_falls_back(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    base = resolve_global_base_model()
+    compiled = channel._thinking_recipe_store.compile(
+        model_name=base["model_name"],
+        base_url=base["base_url"],
+        doc_url=None,
+        snippet="thinking.enabled=true",
+    )
+    compiled["recipe"]["validated"] = False
+    channel._thinking_recipe_store.save(
+        recipe=compiled["recipe"],
+        evidence=compiled["evidence"],
+    )
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "message",
+                "chat_id": "chat1",
+                "content": "hello",
+                "thinking": {"enabled": True, "effort": "max"},
+            },
+        )
+    )
+
+    required = json.loads(conn.send.call_args[0][0])
+    assert required["event"] == "thinking_recipe_required"
+    assert required["reason"] == "unvalidated_recipe"
+
+    inbound = bus.publish_inbound.call_args[0][0]
+    assert inbound.metadata.get("_thinking_enabled") is None
+    assert inbound.metadata.get("_reasoning_effort") is None
+
+
+def test_message_thinking_with_valid_recipe_sets_metadata(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+
+    base = resolve_global_base_model()
+    compiled = channel._thinking_recipe_store.compile(
+        model_name=base["model_name"],
+        base_url=base["base_url"],
+        doc_url=None,
+        snippet="thinking.enabled=true",
+    )
+    channel._thinking_recipe_store.save(
+        recipe=compiled["recipe"],
+        evidence=compiled["evidence"],
+    )
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "message",
+                "chat_id": "chat1",
+                "content": "hello",
+                "thinking": {"enabled": True},
+            },
+        )
+    )
+
+    assert conn.send.await_count == 0
+    inbound = bus.publish_inbound.call_args[0][0]
+    assert inbound.metadata.get("_thinking_enabled") is True
+    assert inbound.metadata.get("_reasoning_effort") == "high"
+
+
+def test_message_thinking_model_not_supported_emits_error_and_falls_back(tmp_path) -> None:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    sm = SessionManager(tmp_path)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, session_manager=sm)
+    conn = AsyncMock()
+    channel._conn_profile[conn] = "alice"
+    row = channel._model_store.add_model(
+        "alice",
+        name="NoThink",
+        model_name="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-user",
+        supports_thinking=False,
+    )
+
+    asyncio.run(
+        channel._dispatch_envelope(
+            conn,
+            "u1",
+            {
+                "type": "message",
+                "chat_id": "chat1",
+                "content": "hello",
+                "model_id": row["id"],
+                "thinking": {"enabled": True},
+            },
+        )
+    )
+
+    event = json.loads(conn.send.call_args[0][0])
+    assert event["event"] == "thinking_recipe_error"
+    assert event["detail"] == "model_does_not_support_thinking"
+    inbound = bus.publish_inbound.call_args[0][0]
+    assert inbound.metadata.get("_thinking_enabled") is None
+    assert inbound.metadata.get("_reasoning_effort") is None

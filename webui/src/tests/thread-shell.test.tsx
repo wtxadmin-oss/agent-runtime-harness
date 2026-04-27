@@ -7,11 +7,22 @@ import { ClientProvider } from "@/providers/ClientProvider";
 
 function makeClient() {
   const errorHandlers = new Set<(err: { kind: string }) => void>();
+  const chatHandlers = new Map<string, Set<(ev: import("@/lib/types").InboundEvent) => void>>();
   return {
     status: "open" as const,
     defaultChatId: null as string | null,
     onStatus: () => () => {},
-    onChat: () => () => {},
+    onChat: (chatId: string, handler: (ev: import("@/lib/types").InboundEvent) => void) => {
+      let set = chatHandlers.get(chatId);
+      if (!set) {
+        set = new Set();
+        chatHandlers.set(chatId, set);
+      }
+      set.add(handler);
+      return () => {
+        set!.delete(handler);
+      };
+    },
     onError: (handler: (err: { kind: string }) => void) => {
       errorHandlers.add(handler);
       return () => {
@@ -21,6 +32,12 @@ function makeClient() {
     _emitError(err: { kind: string }) {
       for (const h of errorHandlers) h(err);
     },
+    _emitChat(chatId: string, ev: import("@/lib/types").InboundEvent) {
+      for (const h of chatHandlers.get(chatId) ?? []) h(ev);
+    },
+    setThinkingToggle: vi.fn(),
+    submitThinkingRecipe: vi.fn(),
+    confirmThinkingRecipe: vi.fn(),
     sendMessage: vi.fn(),
     newChat: vi.fn(),
     attach: vi.fn(),
@@ -99,6 +116,8 @@ describe("ThreadShell", () => {
         "chat-a",
         "persist me across tabs",
         undefined,
+        undefined,
+        undefined,
       ),
     );
     expect(screen.getByText("persist me across tabs")).toBeInTheDocument();
@@ -162,6 +181,8 @@ describe("ThreadShell", () => {
       expect(client.sendMessage).toHaveBeenCalledWith(
         "chat-a",
         "delete me cleanly",
+        undefined,
+        undefined,
         undefined,
       ),
     );
@@ -410,5 +431,191 @@ describe("ThreadShell", () => {
 
     await waitFor(() => expect(screen.getByText("from chat b")).toBeInTheDocument());
     expect(screen.queryByText("from chat a")).not.toBeInTheDocument();
+  });
+
+  it("disables thinking toggle when recipe is missing and sends without thinking params", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-a");
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "attached",
+        chat_id: "chat-a",
+        thinking_supported: true,
+        thinking_recipe_ready: false,
+        thinking_unavailable_reason: "missing_recipe",
+      });
+    });
+
+    const toggle = screen.getByRole("button", { name: "深度思考模式" });
+    expect(toggle).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "send without thinking" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(client.sendMessage).toHaveBeenCalledWith(
+        "chat-a",
+        "send without thinking",
+        undefined,
+        undefined,
+        undefined,
+      ),
+    );
+  });
+
+  it("completes recipe config flow then enables thinking and sends with thinking params", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-a");
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "attached",
+        chat_id: "chat-a",
+        thinking_supported: true,
+        thinking_recipe_ready: false,
+        thinking_unavailable_reason: "missing_recipe",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "配置" }));
+    fireEvent.change(screen.getByLabelText("官方 URL"), {
+      target: { value: "https://api.deepseek.com/docs/reasoning" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提交并预览" }));
+    expect(client.submitThinkingRecipe).toHaveBeenCalledWith("chat-a", {
+      doc_url: "https://api.deepseek.com/docs/reasoning",
+    });
+
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "thinking_recipe_preview",
+        chat_id: "chat-a",
+        preview_id: "pv-1",
+        model_name: "deepseek-v4-flash",
+        base_url: "https://api.deepseek.com",
+        recipe: { controls: { enabled_param: "thinking.enabled" } },
+        evidence: [{ id: "e1", type: "url", source: "https://api.deepseek.com/docs/reasoning" }],
+      });
+    });
+    expect(await screen.findByText("确认思考参数预览")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认并保存" }));
+    expect(client.confirmThinkingRecipe).toHaveBeenCalledWith("chat-a", "pv-1");
+
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "thinking_recipe_saved",
+        chat_id: "chat-a",
+        model_signature: "https://api.deepseek.com::deepseek-v4-flash",
+      });
+    });
+
+    const toggle = screen.getByRole("button", { name: "深度思考模式" });
+    expect(toggle).not.toBeDisabled();
+    fireEvent.click(toggle);
+    expect(client.setThinkingToggle).toHaveBeenCalledWith("chat-a", true);
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "please keep thinking on" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(client.sendMessage).toHaveBeenCalledWith(
+        "chat-a",
+        "please keep thinking on",
+        undefined,
+        { enabled: true, effort: "high" },
+        undefined,
+      ),
+    );
+  });
+
+  it("renders recipe progress and conflict hints during config flow", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-a");
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "attached",
+        chat_id: "chat-a",
+        thinking_supported: true,
+        thinking_recipe_ready: false,
+        thinking_unavailable_reason: "missing_recipe",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "配置" }));
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "thinking_recipe_progress",
+        chat_id: "chat-a",
+        stage: "extracting",
+        message: "extracting url and snippet evidence",
+      });
+      client._emitChat("chat-a", {
+        event: "thinking_recipe_conflict_detected",
+        chat_id: "chat-a",
+        decision: "url",
+        scoring: { url: { credibility: 0.9 } },
+        evidence: [{ kind: "url", source: "https://example.com/docs" }],
+      });
+    });
+
+    expect(screen.getByText(/提取进度: extracting/)).toBeInTheDocument();
+    expect(screen.getByText(/检测到 URL 与 snippet 参数冲突/)).toBeInTheDocument();
+
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "thinking_recipe_preview",
+        chat_id: "chat-a",
+        preview_id: "pv-2",
+        recipe: { controls: { enabled_param: "enable_thinking" } },
+        evidence: [{ id: "e1", type: "url", source: "https://example.com/docs" }],
+      });
+    });
+
+    expect(await screen.findByText("确认思考参数预览")).toBeInTheDocument();
+    expect(screen.getByText(/冲突处理决策: url/)).toBeInTheDocument();
   });
 });

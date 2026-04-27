@@ -7,24 +7,39 @@ import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { preloadMarkdownText } from "@/components/MarkdownText";
 import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
+import { buildSessionKey, createProfile, deleteProfile } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
 import { NanobotClient } from "@/lib/nanobot-client";
 import { ClientProvider } from "@/providers/ClientProvider";
-import type { ChatSummary } from "@/lib/types";
+import type { ChatSummary, ProfileSummary } from "@/lib/types";
 
 type BootState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | {
+    | {
       status: "ready";
       client: NanobotClient;
       token: string;
       modelName: string | null;
+      profileId: string;
+      profiles: ProfileSummary[];
     };
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
 const SIDEBAR_WIDTH = 279;
+function normalizeProfiles(list?: ProfileSummary[]): ProfileSummary[] {
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const rows = list.filter(
+    (p): p is ProfileSummary =>
+      !!p &&
+      typeof p.id === "string" &&
+      p.id.length > 0 &&
+      typeof p.name === "string" &&
+      p.name.length > 0,
+  );
+  return rows;
+}
 
 function readSidebarOpen(): boolean {
   if (typeof window === "undefined") return true;
@@ -41,31 +56,59 @@ export default function App() {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
 
+  const connectForProfile = useCallback(
+    async (
+      requestedProfileId?: string,
+      previousClient?: NanobotClient | null,
+    ): Promise<{
+      client: NanobotClient;
+      token: string;
+      modelName: string | null;
+      profileId: string;
+      profiles: ProfileSummary[];
+    }> => {
+      const boot = await fetchBootstrap("", requestedProfileId);
+      const profiles = normalizeProfiles(boot.profiles);
+      const fallbackProfileId = profiles[0]?.id ?? "";
+      const profileId =
+        (boot.profile_id &&
+        profiles.some((p) => p.id === boot.profile_id))
+          ? boot.profile_id
+          : fallbackProfileId;
+      const url = deriveWsUrl(boot.ws_path, boot.token);
+      const client = new NanobotClient({
+        url,
+        onReauth: async () => {
+          try {
+            const refreshed = await fetchBootstrap("", profileId);
+            return deriveWsUrl(refreshed.ws_path, refreshed.token);
+          } catch {
+            return null;
+          }
+        },
+      });
+      previousClient?.close();
+      client.connect();
+      return {
+        client,
+        token: boot.token,
+        modelName: boot.model_name ?? null,
+        profileId,
+        profiles,
+      };
+    },
+    [],
+  );
+
   useEffect(() => {
     let cancelled = false;
+    let activeClient: NanobotClient | null = null;
     (async () => {
       try {
-        const boot = await fetchBootstrap();
+        const ready = await connectForProfile();
         if (cancelled) return;
-        const url = deriveWsUrl(boot.ws_path, boot.token);
-        const client = new NanobotClient({
-          url,
-          onReauth: async () => {
-            try {
-              const refreshed = await fetchBootstrap();
-              return deriveWsUrl(refreshed.ws_path, refreshed.token);
-            } catch {
-              return null;
-            }
-          },
-        });
-        client.connect();
-        setState({
-          status: "ready",
-          client,
-          token: boot.token,
-          modelName: boot.model_name ?? null,
-        });
+        activeClient = ready.client;
+        setState({ status: "ready", ...ready });
       } catch (e) {
         if (cancelled) return;
         setState({ status: "error", message: (e as Error).message });
@@ -73,8 +116,9 @@ export default function App() {
     })();
     return () => {
       cancelled = true;
+      activeClient?.close();
     };
-  }, []);
+  }, [connectForProfile]);
 
   useEffect(() => {
     const warm = () => preloadMarkdownText();
@@ -92,6 +136,14 @@ export default function App() {
     const id = globalThis.setTimeout(warm, 250);
     return () => globalThis.clearTimeout(id);
   }, []);
+
+  useEffect(() => {
+    if (state.status !== "ready") return;
+    const current = state.client;
+    return () => {
+      current.close();
+    };
+  }, [state]);
 
   if (state.status === "loading") {
     return (
@@ -141,13 +193,66 @@ export default function App() {
       client={state.client}
       token={state.token}
       modelName={state.modelName}
+      profileId={state.profileId}
+      profiles={state.profiles}
     >
-      <Shell />
+      <Shell
+        key={`${state.profileId}:${state.token}`}
+        profileId={state.profileId}
+        profiles={state.profiles}
+        onProfileChange={async (nextProfileId) => {
+          if (nextProfileId === state.profileId) return;
+          const previousClient = state.client;
+          setState({ status: "loading" });
+          try {
+            const ready = await connectForProfile(nextProfileId, previousClient);
+            setState({ status: "ready", ...ready });
+          } catch (e) {
+            setState({ status: "error", message: (e as Error).message });
+          }
+        }}
+        onCreateProfile={async (name) => {
+          const created = await createProfile(state.token, name);
+          if (!created?.id || created.id === state.profileId) return;
+          const previousClient = state.client;
+          setState({ status: "loading" });
+          try {
+            const ready = await connectForProfile(created.id, previousClient);
+            setState({ status: "ready", ...ready });
+          } catch (e) {
+            setState({ status: "error", message: (e as Error).message });
+          }
+        }}
+        onDeleteProfile={async (targetProfileId) => {
+          const deleted = await deleteProfile(state.token, targetProfileId);
+          if (!deleted.deleted) return;
+          const previousClient = state.client;
+          setState({ status: "loading" });
+          try {
+            const ready = await connectForProfile(undefined, previousClient);
+            setState({ status: "ready", ...ready });
+          } catch (e) {
+            setState({ status: "error", message: (e as Error).message });
+          }
+        }}
+      />
     </ClientProvider>
   );
 }
 
-function Shell() {
+function Shell({
+  profileId,
+  profiles,
+  onProfileChange,
+  onCreateProfile,
+  onDeleteProfile,
+}: {
+  profileId: string;
+  profiles: ProfileSummary[];
+  onProfileChange: (profileId: string) => Promise<void>;
+  onCreateProfile: (name: string) => Promise<void>;
+  onDeleteProfile: (profileId: string) => Promise<void>;
+}) {
   const { t, i18n } = useTranslation();
   const { theme, toggle } = useTheme();
   const { sessions, loading, refresh, createChat, deleteChat } = useSessions();
@@ -207,14 +312,30 @@ function Shell() {
   const onNewChat = useCallback(async () => {
     try {
       const chatId = await createChat();
-      setActiveKey(`websocket:${chatId}`);
+      setActiveKey(buildSessionKey(profileId, chatId));
       setMobileSidebarOpen(false);
       return chatId;
     } catch (e) {
       console.error("Failed to create chat", e);
       return null;
     }
-  }, [createChat]);
+  }, [createChat, profileId]);
+
+  const onSwitchProfile = useCallback(
+    async (nextProfileId: string) => {
+      setMobileSidebarOpen(false);
+      await onProfileChange(nextProfileId);
+    },
+    [onProfileChange],
+  );
+
+  const onDeleteUser = useCallback(
+    async (targetProfileId: string) => {
+      setMobileSidebarOpen(false);
+      await onDeleteProfile(targetProfileId);
+    },
+    [onDeleteProfile],
+  );
 
   const onSelectChat = useCallback(
     (key: string) => {
@@ -253,6 +374,13 @@ function Shell() {
       : t("app.documentTitle.base");
   }, [activeSession, headerTitle, i18n.resolvedLanguage, t]);
 
+  useEffect(() => {
+    return () => {
+      // Defensive cleanup for modal stacks (dialog/alert) during profile reconnect remounts.
+      document.body.style.pointerEvents = "";
+    };
+  }, []);
+
   const sidebarProps = {
     sessions,
     activeKey,
@@ -266,6 +394,17 @@ function Shell() {
     onRefresh: () => void refresh(),
     onRequestDelete: (key: string, label: string) =>
       setPendingDelete({ key, label }),
+    profiles,
+    currentProfileId: profileId,
+    onProfileChange: (nextProfileId: string) => {
+      void onSwitchProfile(nextProfileId);
+    },
+    onCreateProfile: async (name: string) => {
+      await onCreateProfile(name);
+    },
+    onDeleteProfile: async (targetProfileId: string) => {
+      await onDeleteUser(targetProfileId);
+    },
   };
 
   return (

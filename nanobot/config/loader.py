@@ -10,10 +10,12 @@ import pydantic
 from loguru import logger
 from pydantic import BaseModel
 
-from nanobot.config.schema import Config
+from nanobot.config.schema import AgentDefaults, Config, ProviderConfig
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+_dotenv_loaded_files: set[Path] = set()
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def set_config_path(path: Path) -> None:
@@ -40,6 +42,7 @@ def load_config(config_path: Path | None = None) -> Config:
         Loaded configuration object.
     """
     path = config_path or get_config_path()
+    _load_dotenv_files(path)
 
     config = Config()
     if path.exists():
@@ -52,8 +55,45 @@ def load_config(config_path: Path | None = None) -> Config:
             logger.warning(f"Failed to load config from {path}: {e}")
             logger.warning("Using default configuration.")
 
+    _apply_deepseek_defaults(config)
     _apply_ssrf_whitelist(config)
     return config
+
+
+def _iter_provider_configs(config: Config) -> list[ProviderConfig]:
+    providers = config.providers
+    rows: list[ProviderConfig] = []
+    for field_name in type(providers).model_fields:
+        value = getattr(providers, field_name, None)
+        if isinstance(value, ProviderConfig):
+            rows.append(value)
+    return rows
+
+
+def _has_any_provider_key(config: Config) -> bool:
+    return any((p.api_key or "").strip() for p in _iter_provider_configs(config))
+
+
+def _apply_deepseek_defaults(config: Config) -> None:
+    """Apply env-driven DeepSeek defaults when user hasn't configured providers yet."""
+    deepseek_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if not deepseek_key:
+        return
+
+    had_provider_key = _has_any_provider_key(config)
+    deepseek = config.providers.deepseek
+    if not (deepseek.api_key or "").strip():
+        deepseek.api_key = deepseek_key
+    if not (deepseek.api_base or "").strip():
+        deepseek.api_base = "https://api.deepseek.com"
+
+    defaults = config.agents.defaults
+    schema_defaults = AgentDefaults()
+    model_untouched = defaults.model == schema_defaults.model
+    provider_untouched = defaults.provider == schema_defaults.provider
+    if deepseek.api_key and not had_provider_key and model_untouched and provider_untouched:
+        defaults.provider = "deepseek"
+        defaults.model = "deepseek-v4-flash"
 
 
 def _apply_ssrf_whitelist(config: Config) -> None:
@@ -145,6 +185,55 @@ def _env_replace(match: re.Match[str]) -> str:
             f"Environment variable '{name}' referenced in config is not set"
         )
     return value
+
+
+def _load_dotenv_files(config_path: Path | None) -> None:
+    """Best-effort .env loading (non-overriding) from common locations."""
+    candidates = []
+    cfg_dir = (config_path or get_config_path()).parent
+    candidates.append(cfg_dir / ".env")
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path.home() / ".nanobot" / ".env")
+
+    for path in candidates:
+        resolved = path.expanduser().resolve()
+        if resolved in _dotenv_loaded_files:
+            continue
+        if not resolved.is_file():
+            continue
+        _load_dotenv_file(resolved)
+        _dotenv_loaded_files.add(resolved)
+
+
+def _strip_wrapped_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        inner = value[1:-1]
+        if value[0] == '"':
+            return bytes(inner, "utf-8").decode("unicode_escape")
+        return inner
+    return value
+
+
+def _load_dotenv_file(path: Path) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if text.startswith("export "):
+            text = text[len("export "):].strip()
+        if "=" not in text:
+            continue
+        key, raw_val = text.split("=", 1)
+        key = key.strip()
+        if not _ENV_KEY_RE.match(key):
+            continue
+        value = _strip_wrapped_quotes(raw_val.strip())
+        os.environ.setdefault(key, value)
 
 
 def _migrate_config(data: dict) -> dict:

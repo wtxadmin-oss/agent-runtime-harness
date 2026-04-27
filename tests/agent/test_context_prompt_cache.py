@@ -148,6 +148,27 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     assert "recent question about K8s" in prompt
 
 
+def test_profile_scoped_system_prompt_uses_profile_user_and_memory(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    (workspace / "USER.md").write_text("root-user", encoding="utf-8")
+    (workspace / "memory").mkdir(parents=True, exist_ok=True)
+    (workspace / "memory" / "MEMORY.md").write_text("root-memory", encoding="utf-8")
+
+    bob_ws = workspace / "users" / "demo_bob"
+    (bob_ws / "memory").mkdir(parents=True, exist_ok=True)
+    (bob_ws / "USER.md").write_text("bob-user", encoding="utf-8")
+    (bob_ws / "memory" / "MEMORY.md").write_text("bob-memory", encoding="utf-8")
+
+    builder = ContextBuilder(workspace)
+    prompt = builder.build_system_prompt(session_key="websocket:demo_bob:chat-1")
+
+    assert "Current profile_id: demo_bob" in prompt
+    assert "bob-user" in prompt
+    assert "bob-memory" in prompt
+    assert "root-user" not in prompt
+    assert "root-memory" not in prompt
+
+
 def test_execution_rules_in_system_prompt(tmp_path) -> None:
     """Execution rules should appear in the system prompt via default SOUL.md."""
     from nanobot.utils.helpers import sync_workspace_templates

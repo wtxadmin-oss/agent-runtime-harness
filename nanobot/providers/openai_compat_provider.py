@@ -421,6 +421,14 @@ class OpenAICompatProvider(LLMProvider):
                 extra = {
                     "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
                 }
+            elif spec.name == "deepseek":
+                extra = {
+                    "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
+                }
+                # Keep DeepSeek effort knobs in sync with the UI toggle.
+                # Example: high -> {"reasoning_effort":"high", "output_config":{"effort":"high"}}
+                if wire_effort in {"high", "max"}:
+                    extra["output_config"] = {"effort": wire_effort}
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
 
@@ -1017,6 +1025,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
         try:
@@ -1080,10 +1089,16 @@ class OpenAICompatProvider(LLMProvider):
                 except StopAsyncIteration:
                     break
                 chunks.append(chunk)
-                if on_content_delta and chunk.choices:
-                    text = getattr(chunk.choices[0].delta, "content", None)
-                    if text:
-                        await on_content_delta(text)
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if on_content_delta:
+                        text = getattr(delta, "content", None)
+                        if text:
+                            await on_content_delta(text)
+                    if on_reasoning_delta:
+                        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        if reasoning:
+                            await on_reasoning_delta(reasoning)
             return self._parse_chunks(chunks)
         except asyncio.TimeoutError:
             return LLMResponse(

@@ -74,6 +74,7 @@ class AgentRunSpec:
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    reasoning_delta_callback: Any | None = None
 
 
 @dataclass(slots=True)
@@ -579,9 +580,11 @@ class AgentRunner:
             async def _stream(delta: str) -> None:
                 await hook.on_stream(context, delta)
 
+            on_reasoning_delta = spec.reasoning_delta_callback
             return await self.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
+                on_reasoning_delta=on_reasoning_delta,
             )
         return await self.provider.chat_with_retry(**kwargs)
 

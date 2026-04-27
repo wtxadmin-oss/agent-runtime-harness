@@ -16,7 +16,7 @@ from loguru import logger
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.memory import Consolidator, Dream, MemoryStore
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
@@ -29,12 +29,16 @@ from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.thinking_recipe import ThinkingRecipeCompileTool, ThinkingRecipeLookupTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
+from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+from nanobot.providers.registry import find_by_name
+from nanobot.profile.model_store import ModelStore
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
@@ -224,6 +228,7 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
+        self._model_store = ModelStore(workspace)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -313,6 +318,8 @@ class AgentLoop:
                 WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy)
             )
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
+        self.tools.register(ThinkingRecipeLookupTool(workspace=self.workspace))
+        self.tools.register(ThinkingRecipeCompileTool(workspace=self.workspace))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -407,6 +414,22 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    @staticmethod
+    def _profile_id_from_session_key(session_key: str | None) -> str | None:
+        if not session_key or not session_key.startswith("websocket:"):
+            return None
+        parts = session_key.split(":", 2)
+        if len(parts) < 3:
+            return None
+        profile_id = parts[1].strip()
+        return profile_id or None
+
+    def _memory_store_for_session_key(self, session_key: str | None) -> MemoryStore:
+        profile_id = self._profile_id_from_session_key(session_key)
+        if not profile_id:
+            return self.context.memory
+        return MemoryStore(self.workspace / "users" / profile_id)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -414,12 +437,16 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
         *,
         session: Session | None = None,
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        reasoning_effort: str | None = None,
+        runner_override: AgentRunner | None = None,
+        model_override: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -508,10 +535,12 @@ class AgentLoop:
 
             return items
 
-        result = await self.runner.run(AgentRunSpec(
+        active_runner = runner_override or self.runner
+        active_model = model_override or self.model
+        result = await active_runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
-            model=self.model,
+            model=active_model,
             max_iterations=self.max_iterations,
             max_tool_result_chars=self.max_tool_result_chars,
             hook=hook,
@@ -526,6 +555,8 @@ class AgentLoop:
             retry_wait_callback=on_retry_wait,
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
+            reasoning_delta_callback=on_reasoning_delta,
+            reasoning_effort=reasoning_effort,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -631,15 +662,21 @@ class AgentLoop:
             async with lock, gate:
                 try:
                     on_stream = on_stream_end = None
+                    on_reasoning_delta = None
                     if msg.metadata.get("_wants_stream"):
                         # Split one answer into distinct stream segments.
                         stream_base_id = f"{msg.session_key}:{time.time_ns()}"
                         stream_segment = 0
+                        thinking_enabled = bool(msg.metadata.get("_thinking_enabled"))
+                        content_chunks: list[str] = []
 
                         def _current_stream_id() -> str:
                             return f"{stream_base_id}:{stream_segment}"
 
                         async def on_stream(delta: str) -> None:
+                            if thinking_enabled:
+                                content_chunks.append(delta)
+                                return
                             meta = dict(msg.metadata or {})
                             meta["_stream_delta"] = True
                             meta["_stream_id"] = _current_stream_id()
@@ -651,6 +688,19 @@ class AgentLoop:
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
+                            if thinking_enabled and content_chunks:
+                                merged = "".join(content_chunks)
+                                content_chunks.clear()
+                                if merged:
+                                    meta_content = dict(msg.metadata or {})
+                                    meta_content["_stream_delta"] = True
+                                    meta_content["_stream_id"] = _current_stream_id()
+                                    await self.bus.publish_outbound(OutboundMessage(
+                                        channel=msg.channel,
+                                        chat_id=msg.chat_id,
+                                        content=merged,
+                                        metadata=meta_content,
+                                    ))
                             meta = dict(msg.metadata or {})
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
@@ -662,8 +712,23 @@ class AgentLoop:
                             ))
                             stream_segment += 1
 
+                        if thinking_enabled:
+                            async def on_reasoning_delta(reasoning: str) -> None:
+                                text = (reasoning or "").strip()
+                                if not text:
+                                    return
+                                meta = dict(msg.metadata or {})
+                                meta["_reasoning_delta"] = True
+                                await self.bus.publish_outbound(OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=text,
+                                    metadata=meta,
+                                ))
+
                     response = await self._process_message(
                         msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        on_reasoning_delta=on_reasoning_delta,
                         pending_queue=pending,
                     )
                     if response is not None:
@@ -755,6 +820,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
@@ -776,6 +842,7 @@ class AgentLoop:
             await self.consolidator.maybe_consolidate_by_tokens(
                 session,
                 session_summary=pending,
+                store=self._memory_store_for_session_key(key),
             )
             # Persist subagent follow-ups into durable history BEFORE prompt
             # assembly. ContextBuilder merges adjacent same-role messages for
@@ -796,6 +863,7 @@ class AgentLoop:
                 current_message="" if is_subagent else msg.content,
                 channel=channel,
                 chat_id=chat_id,
+                session_key=key,
                 session_summary=pending,
                 current_role=current_role,
             )
@@ -807,7 +875,12 @@ class AgentLoop:
             self._save_turn(session, all_msgs, 1 + len(history))
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
-            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(
+                    session,
+                    store=self._memory_store_for_session_key(key),
+                )
+            )
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
@@ -824,11 +897,63 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
+        override_runner: AgentRunner | None = None
+        override_model: str | None = None
+        reasoning_effort = msg.metadata.get("_reasoning_effort")
+        model_id = msg.metadata.get("_model_id")
+        if isinstance(model_id, str) and model_id:
+            profile_id = self._profile_id_from_session_key(key)
+            if profile_id:
+                try:
+                    row = self._model_store.get_model(profile_id, model_id)
+                except Exception as e:
+                    logger.warning(
+                        "Failed loading model '{}' for profile '{}', fallback to base model: {}",
+                        model_id,
+                        profile_id,
+                        e,
+                    )
+                    row = None
+                if row is not None:
+                    model_name = (row.get("model_name") or "").strip()
+                    api_key = (row.get("api_key") or "").strip()
+                    base_url = (row.get("base_url") or "").strip()
+                    if not model_name or not api_key or not base_url:
+                        logger.warning(
+                            "Model '{}' has incomplete config, fallback to base model",
+                            model_id,
+                        )
+                    else:
+                        try:
+                            spec = find_by_name("custom")
+                            provider = OpenAICompatProvider(
+                                api_key=api_key,
+                                api_base=base_url,
+                                default_model=model_name,
+                                spec=spec,
+                            )
+                            provider.generation = self.provider.generation
+                            override_runner = AgentRunner(provider)
+                            override_model = model_name
+                            if not bool(row.get("supports_thinking", False)):
+                                reasoning_effort = None
+                        except Exception as e:
+                            logger.warning(
+                                "Failed preparing model '{}' provider, fallback to base model: {}",
+                                model_id,
+                                e,
+                            )
+
         session = self.sessions.get_or_create(key)
+        active_model_name = (override_model or self.model or "").strip() or str(self.model)
+        # Persist the effective model for this session so tools/UI can report
+        # the actually used runtime model instead of only static defaults.
+        session.metadata["active_model_name"] = active_model_name
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
         if self._restore_pending_user_turn(session):
             self.sessions.save(session)
+        self.sessions.save(session)
 
         session, pending = self.auto_compact.prepare_session(session, key)
 
@@ -841,6 +966,7 @@ class AgentLoop:
         await self.consolidator.maybe_consolidate_by_tokens(
             session,
             session_summary=pending,
+            store=self._memory_store_for_session_key(key),
         )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
@@ -853,11 +979,20 @@ class AgentLoop:
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
+            session_key=key,
             session_summary=pending,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        runtime_hint = (
+            f"Runtime model for this turn: {active_model_name}. "
+            "If asked which model you are currently using, answer with this value."
+        )
+        if initial_messages and initial_messages[0].get("role") == "system":
+            initial_messages.insert(1, {"role": "system", "content": runtime_hint})
+        else:
+            initial_messages.insert(0, {"role": "system", "content": runtime_hint})
 
         async def _bus_progress(
             content: str,
@@ -912,11 +1047,15 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             on_retry_wait=_on_retry_wait,
+            on_reasoning_delta=on_reasoning_delta,
             session=session,
             channel=msg.channel,
             chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
             pending_queue=pending_queue,
+            reasoning_effort=reasoning_effort,
+            runner_override=override_runner,
+            model_override=override_model,
         )
 
         if final_content is None or not final_content.strip():
@@ -928,7 +1067,12 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
-        self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        self._schedule_background(
+            self.consolidator.maybe_consolidate_by_tokens(
+                session,
+                store=self._memory_store_for_session_key(key),
+            )
+        )
 
         # When follow-up messages were injected mid-turn, a later natural
         # language reply may address those follow-ups and should not be

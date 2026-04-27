@@ -304,6 +304,10 @@ class MyTool(Tool):
     def _inspect(self, key: str | None) -> str:
         if not key:
             return self._inspect_all()
+        if key == "model":
+            model_view = self._inspect_model()
+            if model_view:
+                return model_view
         top = key.split(".")[0]
         if top in self._DENIED_ATTRS or top.startswith("__"):
             return f"Error: '{top}' is not accessible"
@@ -329,6 +333,11 @@ class MyTool(Tool):
         parts: list[str] = []
         # RESTRICTED keys
         for k in self.RESTRICTED:
+            if k == "model":
+                model_view = self._inspect_model()
+                if model_view:
+                    parts.append(model_view)
+                    continue
             parts.append(self._format_value(getattr(loop, k, None), k))
         # Other useful top-level keys shown in description
         for k in ("workspace", "provider_retry_mode", "max_tool_result_chars", "_current_iteration", "web_config", "exec_config", "subagents"):
@@ -342,6 +351,63 @@ class MyTool(Tool):
         if rv:
             parts.append(self._format_value(rv, "scratchpad"))
         return "\n".join(parts)
+
+    def _session_candidate_keys(self) -> list[str]:
+        channel = (self._channel or "").strip()
+        chat_id = (self._chat_id or "").strip()
+        if not channel or not chat_id:
+            return []
+        candidates: list[str] = [f"{channel}:{chat_id}"]
+        sessions = getattr(self._loop, "sessions", None)
+        if sessions is None or not hasattr(sessions, "list_sessions"):
+            return candidates
+        try:
+            rows = sessions.list_sessions()
+        except Exception:
+            return candidates
+        if not isinstance(rows, list):
+            return candidates
+        suffix = f":{chat_id}"
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("key")
+            if not isinstance(key, str):
+                continue
+            if key.startswith(f"{channel}:") and key.endswith(suffix) and key not in candidates:
+                candidates.append(key)
+        return candidates
+
+    def _selected_session_model(self) -> str | None:
+        sessions = getattr(self._loop, "sessions", None)
+        if sessions is None or not hasattr(sessions, "read_session_file"):
+            return None
+        for key in self._session_candidate_keys():
+            try:
+                payload = sessions.read_session_file(key)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            active_name = metadata.get("active_model_name")
+            if isinstance(active_name, str) and active_name.strip():
+                return active_name.strip()
+            selected_name = metadata.get("selected_model_name")
+            if isinstance(selected_name, str) and selected_name.strip():
+                return selected_name.strip()
+        return None
+
+    def _inspect_model(self) -> str:
+        default_model = getattr(self._loop, "model", None)
+        selected = self._selected_session_model()
+        if selected:
+            if isinstance(default_model, str) and default_model.strip() and selected != default_model:
+                return f"model: {selected!r} (session-selected, default={default_model!r})"
+            return f"model: {selected!r}"
+        return self._format_value(default_model, "model")
 
     # -- modify --
 

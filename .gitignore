@@ -3,6 +3,9 @@
 .assets
 .docs
 .env
+
+# Dev Container secrets (API keys, proxy config — never commit)
+.devcontainer/.env
 .web
 .orion
 

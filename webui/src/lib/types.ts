@@ -28,6 +28,10 @@ export interface UIMessage {
   content: string;
   kind?: MessageKind;
   isStreaming?: boolean;
+  /** True while reasoning_delta chunks are still arriving. */
+  isThinking?: boolean;
+  /** Accumulated reasoning/thinking content from DeepSeek thinking mode. */
+  reasoning?: string;
   createdAt: number;
   /** For trace rows: each individual hint line, so consecutive hints can
    * render as a single collapsible group. */
@@ -41,10 +45,17 @@ export interface ChatSummary {
   key: string;
   /** Local channel + chat_id parts derived from ``key`` for convenience. */
   channel: string;
+  /** Optional profile scope (websocket:profile:chat). */
+  profileId?: string;
   chatId: string;
   createdAt: string | null;
   updatedAt: string | null;
   preview: string;
+}
+
+export interface ProfileSummary {
+  id: string;
+  name: string;
 }
 
 export interface BootstrapResponse {
@@ -52,6 +63,19 @@ export interface BootstrapResponse {
   ws_path: string;
   expires_in: number;
   model_name?: string | null;
+  profile_id?: string;
+  profiles?: ProfileSummary[];
+}
+
+export interface ModelOption {
+  id: string;
+  name: string;
+  model_name: string;
+  base_url: string;
+  supports_thinking: boolean;
+  readonly: boolean;
+  source: "global_base" | "user_custom";
+  has_api_key: boolean;
 }
 
 export type ConnectionStatus =
@@ -64,7 +88,29 @@ export type ConnectionStatus =
 
 export type InboundEvent =
   | { event: "ready"; chat_id: string; client_id: string }
-  | { event: "attached"; chat_id: string }
+  | {
+      event: "attached";
+      chat_id: string;
+      selected_model_id?: string | null;
+      selected_model_name?: string | null;
+      selected_model_supports_thinking?: boolean | null;
+      thinking_supported?: boolean;
+      thinking_recipe_ready?: boolean;
+      thinking_unavailable_reason?: string | null;
+    }
+  | { event: "model_list"; models: ModelOption[] }
+  | { event: "model_saved"; model: ModelOption }
+  | { event: "model_deleted"; model_id: string }
+  | {
+      event: "model_selected";
+      chat_id: string;
+      selected_model_id?: string | null;
+      selected_model_name?: string | null;
+      selected_model_supports_thinking?: boolean | null;
+      thinking_supported?: boolean;
+      thinking_recipe_ready?: boolean;
+      thinking_unavailable_reason?: string | null;
+    }
   | {
       event: "message";
       chat_id: string;
@@ -86,6 +132,55 @@ export type InboundEvent =
       chat_id: string;
       stream_id?: string;
     }
+  | {
+      event: "reasoning_delta";
+      chat_id: string;
+      text: string;
+    }
+  | {
+      event: "thinking_recipe_required";
+      chat_id: string;
+      reason?: string;
+    }
+  | {
+      event: "thinking_recipe_preview";
+      chat_id: string;
+      preview_id: string;
+      model_name?: string;
+      base_url?: string;
+      recipe?: Record<string, unknown>;
+      evidence?: Record<string, unknown>[];
+    }
+  | {
+      event: "thinking_recipe_progress";
+      chat_id: string;
+      stage: "submitted" | "extracting" | "compiling" | "preview_ready";
+      message?: string;
+      meta?: Record<string, unknown>;
+    }
+  | {
+      event: "thinking_recipe_conflict_detected";
+      chat_id: string;
+      model_name?: string;
+      base_url?: string;
+      decision?: string;
+      scoring?: Record<string, unknown>;
+      evidence?: Record<string, unknown>[];
+    }
+  | {
+      event: "thinking_recipe_saved";
+      chat_id: string;
+      model_signature?: string;
+      model_name?: string;
+      base_url?: string;
+      updated_at?: string;
+      created?: boolean;
+    }
+  | {
+      event: "thinking_recipe_error";
+      chat_id?: string;
+      detail?: string;
+    }
   | { event: "error"; chat_id?: string; detail?: string };
 
 /** Base64-encoded image attached to an outbound ``message`` envelope.
@@ -104,9 +199,41 @@ export interface OutboundMedia {
 export type Outbound =
   | { type: "new_chat" }
   | { type: "attach"; chat_id: string }
+  | { type: "model_list" }
+  | {
+      type: "model_add";
+      name: string;
+      model_name: string;
+      base_url: string;
+      api_key: string;
+      supports_thinking?: boolean;
+      thinking_doc_url?: string;
+      thinking_snippet?: string;
+    }
+  | { type: "model_delete"; model_id: string }
+  | { type: "model_select"; chat_id: string; model_id?: string | null }
+  | { type: "thinking_toggle"; chat_id: string; enabled: boolean }
+  | {
+      type: "thinking_recipe_submit";
+      chat_id: string;
+      model_id?: string;
+      doc_url?: string;
+      snippet?: string;
+    }
+  | {
+      type: "thinking_recipe_confirm";
+      chat_id: string;
+      preview_id: string;
+    }
   | {
       type: "message";
       chat_id: string;
       content: string;
       media?: OutboundMedia[];
+      model_id?: string;
+      /** Optional thinking/reasoning mode parameters. */
+      thinking?: {
+        enabled: boolean;
+        effort?: "high" | "max";
+      };
     };

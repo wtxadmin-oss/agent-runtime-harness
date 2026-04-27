@@ -117,6 +117,13 @@ class BaseChannel(ABC):
         """
         pass
 
+    async def send_reasoning_delta(self, chat_id: str, reasoning: str) -> None:
+        """Deliver a streaming reasoning/thinking chunk.
+
+        Override in subclasses that support deep thinking mode.
+        """
+        pass
+
     @property
     def supports_streaming(self) -> bool:
         """True when config enables streaming AND this subclass implements send_delta."""

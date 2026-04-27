@@ -1,4 +1,4 @@
-import type { ChatSummary } from "./types";
+import type { ChatSummary, ProfileSummary } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -28,10 +28,29 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-function splitKey(key: string): { channel: string; chatId: string } {
-  const idx = key.indexOf(":");
-  if (idx === -1) return { channel: "", chatId: key };
-  return { channel: key.slice(0, idx), chatId: key.slice(idx + 1) };
+export function parseSessionKey(
+  key: string,
+): { channel: string; profileId?: string; chatId: string } {
+  const parts = key.split(":");
+  if (parts.length === 0) return { channel: "", chatId: key };
+  if (parts[0] !== "websocket") {
+    if (parts.length === 1) return { channel: "", chatId: key };
+    return { channel: parts[0], chatId: parts.slice(1).join(":") };
+  }
+  // websocket:chat-id (legacy)
+  if (parts.length === 2) {
+    return { channel: "websocket", chatId: parts[1] };
+  }
+  // websocket:profile-id:chat-id (current)
+  return {
+    channel: "websocket",
+    profileId: parts[1],
+    chatId: parts.slice(2).join(":"),
+  };
+}
+
+export function buildSessionKey(profileId: string, chatId: string): string {
+  return `websocket:${profileId}:${chatId}`;
 }
 
 export async function listSessions(
@@ -50,7 +69,7 @@ export async function listSessions(
   );
   return body.sessions.map((s) => ({
     key: s.key,
-    ...splitKey(s.key),
+    ...parseSessionKey(s.key),
     createdAt: s.created_at,
     updatedAt: s.updated_at,
     preview: s.preview ?? "",
@@ -103,4 +122,50 @@ export async function deleteSession(
     token,
   );
   return body.deleted;
+}
+
+export async function listProfiles(
+  token: string,
+  base: string = "",
+): Promise<{ profiles: ProfileSummary[]; currentProfileId: string }> {
+  const body = await request<{
+    profiles: ProfileSummary[];
+    current_profile_id: string;
+  }>(`${base}/api/profiles`, token);
+  return {
+    profiles: body.profiles,
+    currentProfileId: body.current_profile_id,
+  };
+}
+
+export async function createProfile(
+  token: string,
+  name: string,
+  base: string = "",
+): Promise<ProfileSummary> {
+  const clean = name.trim();
+  if (!clean) {
+    throw new Error("profile name cannot be empty");
+  }
+  const body = await request<{ profile: ProfileSummary }>(
+    `${base}/api/profiles/create?name=${encodeURIComponent(clean)}`,
+    token,
+  );
+  return body.profile;
+}
+
+export async function deleteProfile(
+  token: string,
+  profileId: string,
+  base: string = "",
+): Promise<{ deleted: boolean; profileId: string }> {
+  const clean = profileId.trim();
+  if (!clean) {
+    throw new Error("profile id cannot be empty");
+  }
+  const body = await request<{ deleted: boolean; profile_id: string }>(
+    `${base}/api/profiles/delete?profile_id=${encodeURIComponent(clean)}`,
+    token,
+  );
+  return { deleted: body.deleted, profileId: body.profile_id };
 }

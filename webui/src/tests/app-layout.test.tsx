@@ -47,6 +47,15 @@ vi.mock("@/lib/bootstrap", () => ({
   deriveWsUrl: vi.fn(() => "ws://test"),
 }));
 
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    createProfile: vi.fn(),
+    deleteProfile: vi.fn(),
+  };
+});
+
 vi.mock("@/lib/nanobot-client", () => {
   class MockClient {
     status = "idle" as const;
@@ -66,6 +75,12 @@ vi.mock("@/lib/nanobot-client", () => {
 });
 
 import App from "@/App";
+import { fetchBootstrap } from "@/lib/bootstrap";
+import { createProfile, deleteProfile } from "@/lib/api";
+
+const fetchBootstrapMock = vi.mocked(fetchBootstrap);
+const createProfileMock = vi.mocked(createProfile);
+const deleteProfileMock = vi.mocked(deleteProfile);
 
 describe("App layout", () => {
   beforeEach(() => {
@@ -74,6 +89,8 @@ describe("App layout", () => {
     refreshSpy.mockReset();
     createChatSpy.mockClear();
     deleteChatSpy.mockReset();
+    createProfileMock.mockReset();
+    deleteProfileMock.mockReset();
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -146,4 +163,106 @@ describe("App layout", () => {
     expect(screen.queryByText('Delete “First chat”?')).not.toBeInTheDocument();
     expect(document.body.style.pointerEvents).not.toBe("none");
   }, 15_000);
+
+  it("can switch bob then switch back to alice", async () => {
+    fetchBootstrapMock.mockImplementation(async (_base, profileId) => ({
+      token: profileId === "demo_bob" ? "tok-bob" : "tok-alice",
+      ws_path: "/",
+      expires_in: 300,
+      profile_id: profileId ?? "demo_alice",
+      profiles: [
+        { id: "demo_alice", name: "Alice" },
+        { id: "demo_bob", name: "Bob" },
+      ],
+    }));
+
+    render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+
+    fireEvent.pointerDown(screen.getByLabelText("Select profile"), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Bob" }));
+    await waitFor(() =>
+      expect(fetchBootstrapMock).toHaveBeenCalledWith("", "demo_bob"),
+    );
+
+    fireEvent.pointerDown(screen.getByLabelText("Select profile"), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Alice" }));
+    await waitFor(() =>
+      expect(fetchBootstrapMock).toHaveBeenCalledWith("", "demo_alice"),
+    );
+  });
+
+  it("creates a user profile and switches to it", async () => {
+    createProfileMock.mockResolvedValue({ id: "charlie-user", name: "Charlie" });
+    fetchBootstrapMock.mockImplementation(async (_base, profileId) => ({
+      token:
+        profileId === "charlie-user"
+          ? "tok-charlie"
+          : profileId === "demo_bob"
+            ? "tok-bob"
+            : "tok-alice",
+      ws_path: "/",
+      expires_in: 300,
+      profile_id: profileId ?? "demo_alice",
+      profiles:
+        profileId === "charlie-user"
+          ? [
+            { id: "demo_alice", name: "Alice" },
+            { id: "demo_bob", name: "Bob" },
+            { id: "charlie-user", name: "Charlie" },
+          ]
+          : [
+            { id: "demo_alice", name: "Alice" },
+            { id: "demo_bob", name: "Bob" },
+          ],
+    }));
+
+    render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByLabelText("Create user"));
+    fireEvent.change(screen.getByPlaceholderText("Username"), {
+      target: { value: "Charlie" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(createProfileMock).toHaveBeenCalledWith("tok-alice", "Charlie"));
+    await waitFor(() =>
+      expect(fetchBootstrapMock).toHaveBeenCalledWith("", "charlie-user"),
+    );
+  });
+
+  it("deletes another profile and reconnects current profile", async () => {
+    deleteProfileMock.mockResolvedValue({ deleted: true, profileId: "demo_bob" });
+    fetchBootstrapMock.mockImplementation(async (_base, profileId) => ({
+      token: "tok-alice",
+      ws_path: "/",
+      expires_in: 300,
+      profile_id: profileId ?? "demo_alice",
+      profiles: [
+        { id: "demo_alice", name: "Alice" },
+        { id: "demo_bob", name: "Bob" },
+      ],
+    }));
+
+    render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+
+    fireEvent.pointerDown(screen.getByLabelText("Delete user"), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Bob" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(deleteProfileMock).toHaveBeenCalledWith("tok-alice", "demo_bob"),
+    );
+    await waitFor(() =>
+      expect(fetchBootstrapMock).toHaveBeenCalledWith("", "demo_alice"),
+    );
+  });
 });

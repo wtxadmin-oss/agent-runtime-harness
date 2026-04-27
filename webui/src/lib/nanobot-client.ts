@@ -13,6 +13,7 @@ const WS_CLOSING = 2;
 type Unsubscribe = () => void;
 type EventHandler = (ev: InboundEvent) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
+type GlobalEventHandler = (ev: InboundEvent) => void;
 
 /** Structured connection-level errors surfaced to the UI.
  *
@@ -58,6 +59,7 @@ export class NanobotClient {
   private socket: WebSocket | null = null;
   private statusHandlers = new Set<StatusHandler>();
   private errorHandlers = new Set<ErrorHandler>();
+  private globalHandlers = new Set<GlobalEventHandler>();
   // chat_id -> handlers listening on it
   private chatHandlers = new Map<string, Set<EventHandler>>();
   // chat_ids we've attached to since connect; re-attached after reconnects
@@ -131,6 +133,14 @@ export class NanobotClient {
     };
   }
 
+  /** Subscribe to connection-level events not scoped to a specific chat_id. */
+  onGlobal(handler: GlobalEventHandler): Unsubscribe {
+    this.globalHandlers.add(handler);
+    return () => {
+      this.globalHandlers.delete(handler);
+    };
+  }
+
   connect(): void {
     if (this.socket && this.socket.readyState < WS_CLOSING) return;
     this.intentionallyClosed = false;
@@ -181,13 +191,71 @@ export class NanobotClient {
     }
   }
 
-  sendMessage(chatId: string, content: string, media?: OutboundMedia[]): void {
+  sendMessage(
+    chatId: string,
+    content: string,
+    media?: OutboundMedia[],
+    thinking?: { enabled: boolean; effort?: "high" | "max" },
+    modelId?: string,
+  ): void {
     this.knownChats.add(chatId);
     const frame: Outbound =
       media && media.length > 0
-        ? { type: "message", chat_id: chatId, content, media }
-        : { type: "message", chat_id: chatId, content };
+        ? {
+            type: "message",
+            chat_id: chatId,
+            content,
+            media,
+            ...(thinking ? { thinking } : {}),
+            ...(modelId ? { model_id: modelId } : {}),
+          }
+        : {
+            type: "message",
+            chat_id: chatId,
+            content,
+            ...(thinking ? { thinking } : {}),
+            ...(modelId ? { model_id: modelId } : {}),
+          };
     this.queueSend(frame);
+  }
+
+  requestModelList(): void {
+    this.queueSend({ type: "model_list" });
+  }
+
+  addModel(payload: {
+    name: string;
+    model_name: string;
+    base_url: string;
+    api_key: string;
+    supports_thinking?: boolean;
+    thinking_doc_url?: string;
+    thinking_snippet?: string;
+  }): void {
+    this.queueSend({ type: "model_add", ...payload });
+  }
+
+  deleteModel(modelId: string): void {
+    this.queueSend({ type: "model_delete", model_id: modelId });
+  }
+
+  selectModel(chatId: string, modelId: string | null): void {
+    this.queueSend({ type: "model_select", chat_id: chatId, model_id: modelId });
+  }
+
+  setThinkingToggle(chatId: string, enabled: boolean): void {
+    this.queueSend({ type: "thinking_toggle", chat_id: chatId, enabled });
+  }
+
+  submitThinkingRecipe(
+    chatId: string,
+    payload: { model_id?: string; doc_url?: string; snippet?: string },
+  ): void {
+    this.queueSend({ type: "thinking_recipe_submit", chat_id: chatId, ...payload });
+  }
+
+  confirmThinkingRecipe(chatId: string, previewId: string): void {
+    this.queueSend({ type: "thinking_recipe_confirm", chat_id: chatId, preview_id: previewId });
   }
 
   // -- internals ---------------------------------------------------------
@@ -235,6 +303,35 @@ export class NanobotClient {
       return;
     }
 
+    if (
+      parsed.event === "model_list"
+      || parsed.event === "model_saved"
+      || parsed.event === "model_deleted"
+      || parsed.event === "model_selected"
+      || parsed.event === "thinking_recipe_required"
+      || parsed.event === "thinking_recipe_progress"
+      || parsed.event === "thinking_recipe_conflict_detected"
+      || parsed.event === "thinking_recipe_preview"
+      || parsed.event === "thinking_recipe_saved"
+      || parsed.event === "thinking_recipe_error"
+    ) {
+      this.dispatchGlobal(parsed);
+      if (
+        parsed.event === "model_selected"
+        || parsed.event === "thinking_recipe_required"
+        || parsed.event === "thinking_recipe_progress"
+        || parsed.event === "thinking_recipe_conflict_detected"
+        || parsed.event === "thinking_recipe_preview"
+        || parsed.event === "thinking_recipe_saved"
+        || parsed.event === "thinking_recipe_error"
+      ) {
+        if (typeof parsed.chat_id === "string" && parsed.chat_id) {
+          this.dispatch(parsed.chat_id, parsed);
+        }
+      }
+      return;
+    }
+
     const chatId = (parsed as { chat_id?: string }).chat_id;
     if (chatId) this.dispatch(chatId, parsed);
   }
@@ -243,6 +340,10 @@ export class NanobotClient {
     const handlers = this.chatHandlers.get(chatId);
     if (!handlers) return;
     for (const h of handlers) h(ev);
+  }
+
+  private dispatchGlobal(ev: InboundEvent): void {
+    for (const h of this.globalHandlers) h(ev);
   }
 
   private handleClose(event?: { code?: number }): void {

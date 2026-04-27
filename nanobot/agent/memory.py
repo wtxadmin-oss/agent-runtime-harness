@@ -486,13 +486,19 @@ class Consolidator:
             self._get_tool_definitions(),
         )
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    async def archive(
+        self,
+        messages: list[dict],
+        *,
+        store: MemoryStore | None = None,
+    ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
         """
         if not messages:
             return None
+        target_store = store or self.store
         try:
             formatted = MemoryStore._format_messages(messages)
             response = await self.provider.chat_with_retry(
@@ -513,11 +519,11 @@ class Consolidator:
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
             summary = response.content or "[no summary]"
-            self.store.append_history(summary)
+            target_store.append_history(summary)
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages)
+            target_store.raw_archive(messages)
             return None
 
     async def maybe_consolidate_by_tokens(
@@ -525,6 +531,7 @@ class Consolidator:
         session: Session,
         *,
         session_summary: str | None = None,
+        store: MemoryStore | None = None,
     ) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
 
@@ -597,7 +604,7 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
+                summary = await self.archive(chunk, store=store)
                 if summary:
                     last_summary = summary
                 else:
