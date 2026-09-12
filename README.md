@@ -2,7 +2,7 @@
 
 基于 [HKUDS/nanobot](https://github.com/HKUDS/nanobot) 扩展的 Agent Runtime 工程分支，聚焦模型配置、Thinking Recipe、Session / Memory、工具事件与 WebUI 协同。
 
-本仓库用于验证生产级 Agent 系统中的运行时治理问题，不包含任何企业内部代码、数据或 Prompt。上游项目的历史提交与通用能力归原作者所有；本仓库重点展示个人新增的工程扩展与架构分析。
+本仓库用于验证生产级 Agent 系统中的运行时治理问题。上游项目的历史提交与通用能力归原作者所有；本仓库重点展示个人新增的工程扩展、验证方式与架构分析。
 
 ## 工程方向
 
